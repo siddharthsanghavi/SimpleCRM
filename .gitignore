@@ -1,0 +1,37 @@
+node_modules/
+.next/
+out/
+build/
+.env
+.env.local
+.env*.local
+.vercel
+*.tsbuildinfo
+next-env.d.ts
+.DS_Store
+
+# Company data lives in Supabase, not in the repo. Export from the app's
+# Import / Export page when you need a copy.
+data/
+*.csv
+*.tsv
+*.xlsx
+
+# Deployment-specific notes, kept out of the shared repo.
+DEPLOYMENT.local.md
+*.local.md
+
+# Seeded design-canvas payload: ~2MB of generated editor code, rebuilt from the
+# .dc.html sources next to it. The sources are the thing worth keeping.
+design/*.html
+!design/*.dc.html
+
+# Claude Code's own working files: local tool settings and a per-machine
+# instructions file. Nothing here is part of the app.
+.claude/
+CLAUDE.md
+
+# Generated code graph. 2.5 MB of derived data, rebuilt in seconds with
+# `graphify update .`, and it changes on every edit — committing it would turn
+# every pull request into a diff of a machine-written artefact.
+graphify-out/

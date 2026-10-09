@@ -1,0 +1,2550 @@
+-- simpleCRM schema. Run this once in the Supabase SQL editor.
+-- Security model: an email must be in `allowed_emails` before a profile is created
+-- for it. Every table's RLS policy requires a profile row, so a stranger who signs
+-- up sees an empty database rather than your data.
+
+create extension if not exists "uuid-ossp";
+
+-- ---------------------------------------------------------------- access control
+
+create table allowed_emails (
+  email      text primary key,
+  note       text,
+  -- What this address becomes on first sign-in, so an invited viewer never
+  -- spends a day as a member.
+  role       text not null default 'member' check (role in ('viewer', 'member', 'admin')),
+  added_at   timestamptz not null default now()
+);
+
+create table profiles (
+  id         uuid primary key references auth.users on delete cascade,
+  email      text not null unique,
+  full_name  text,
+  role       text not null default 'member' check (role in ('viewer', 'member', 'admin')),
+  created_at timestamptz not null default now()
+);
+
+-- Fires when someone completes a magic-link signup. Only mints a profile if their
+-- address was pre-approved, so the allowlist is the single gate into the app.
+create or replace function handle_new_user()
+returns trigger
+language plpgsql
+security definer set search_path = public
+as $$
+declare invited text;
+begin
+  select role into invited from allowed_emails where lower(email) = lower(new.email);
+
+  if invited is not null then
+    insert into profiles (id, email, full_name, role)
+    values (new.id, new.email, new.raw_user_meta_data ->> 'full_name', invited)
+    on conflict (id) do nothing;
+  end if;
+
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function handle_new_user();
+
+-- Used by every policy below. security definer so it can read profiles without
+-- recursing into profiles' own RLS policy.
+-- Two questions, deliberately separate. has_access() is "has a profile at all"
+-- and backs every read policy; is_member() is "may write" and backs every write
+-- policy. That split is the viewer role, so a new table whose read policy calls
+-- is_member() by habit will quietly deny viewers, and one whose write policy
+-- calls has_access() will quietly let them write.
+create or replace function has_access()
+returns boolean
+language sql
+security definer set search_path = public
+stable
+as $$
+  select exists (select 1 from profiles where id = auth.uid());
+$$;
+
+create or replace function is_member()
+returns boolean
+language sql
+security definer set search_path = public
+stable
+as $$
+  select exists (select 1 from profiles where id = auth.uid() and role in ('member', 'admin'));
+$$;
+
+create or replace function is_admin()
+returns boolean
+language sql
+security definer set search_path = public
+stable
+as $$
+  select exists (select 1 from profiles where id = auth.uid() and role = 'admin');
+$$;
+
+-- ---------------------------------------------------------------- crm tables
+
+create table companies (
+  id          uuid primary key default uuid_generate_v4(),
+  name        text not null,
+  website     text,
+  industry    text,
+  -- Outreach stage. Your club's pipeline lives here rather than in a separate
+  -- deals table, so a company is the unit you track from cold to closed.
+  status      text not null default 'prospect'
+              check (status in ('prospect', 'contacted', 'in_conversation',
+                                'committed', 'declined', 'dormant')),
+  -- What you want from them; a company can be both.
+  interest    text[] not null default '{}',   -- 'tour', 'sponsorship'
+  notes       text,
+
+  -- Directory fields, populated from an imported prospect list. These are what
+  -- you filter by when picking who to call this week.
+  type        text,          -- OEM, Integrator, Large Manufacturer, Machine Shop…
+  tier        text,          -- Tier 1..3, or Reference. Tier 1 = call first.
+  -- Sorting on `tier` alphabetically would put "Reference" above "Tier 1",
+  -- which is exactly backwards. Rank it explicitly instead.
+  tier_rank   integer generated always as (
+                case tier
+                  when 'Tier 1' then 1
+                  when 'Tier 2' then 2
+                  when 'Tier 3' then 3
+                  when 'Reference' then 4
+                  else 5
+                end) stored,
+  city        text,
+  region      text,
+  address     text,
+  phone       text,
+  employees   integer,
+  owner_id    uuid references profiles on delete set null,
+  created_by  uuid references profiles on delete set null,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
+create table contacts (
+  id          uuid primary key default uuid_generate_v4(),
+  company_id  uuid references companies on delete cascade,
+  first_name  text not null,
+  last_name   text,
+  email       text,
+  phone       text,
+  title       text,
+  notes       text,
+  owner_id    uuid references profiles on delete set null,
+  created_by  uuid references profiles on delete set null,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
+create table activities (
+  id          uuid primary key default uuid_generate_v4(),
+  company_id  uuid references companies on delete cascade,
+  contact_id  uuid references contacts on delete set null,
+  type        text not null default 'note'
+              check (type in ('note', 'email', 'call', 'meeting', 'linkedin', 'other')),
+  subject     text,
+  body        text,
+  occurred_at timestamptz not null default now(),
+  created_by  uuid references profiles on delete set null,
+  created_at  timestamptz not null default now()
+);
+
+create table tasks (
+  id          uuid primary key default uuid_generate_v4(),
+  title       text not null,
+  details     text,
+  due_date    date,
+  done        boolean not null default false,
+  done_at     timestamptz,
+  company_id  uuid references companies on delete cascade,
+  contact_id  uuid references contacts on delete set null,
+  assignee_id uuid references profiles on delete set null,
+  created_by  uuid references profiles on delete set null,
+  created_at  timestamptz not null default now()
+);
+
+create index on contacts (company_id);
+create index on activities (company_id, occurred_at desc);
+create index on activities (contact_id);
+create index on tasks (assignee_id, done, due_date);
+create index on companies (status);
+create index on companies (tier_rank, name);
+create index on companies (type);
+create index on companies (region);
+
+-- Free-text search across the fields you'd actually search by.
+create index companies_search on companies
+  using gin (to_tsvector('english',
+    name || ' ' || coalesce(industry, '') || ' ' || coalesce(notes, '') || ' '
+         || coalesce(city, '') || ' ' || coalesce(type, '')));
+create index contacts_search on contacts
+  using gin (to_tsvector('english', first_name || ' ' || coalesce(last_name, '') || ' ' || coalesce(email, '')));
+
+create or replace function touch_updated_at()
+returns trigger language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
+create trigger companies_touch before update on companies
+  for each row execute function touch_updated_at();
+create trigger contacts_touch before update on contacts
+  for each row execute function touch_updated_at();
+
+-- Every function in `public` is also published as a REST endpoint
+-- (/rest/v1/rpc/<name>). These two are only ever fired by triggers, so nothing
+-- should be able to reach them directly.
+revoke execute on function handle_new_user()  from anon, authenticated, public;
+revoke execute on function touch_updated_at() from anon, authenticated, public;
+
+-- is_member() and is_admin() must KEEP their EXECUTE grant. Policy evaluation
+-- runs as the querying role, so revoking it makes every member query fail with
+-- "permission denied for function is_member" rather than returning their rows.
+grant execute on function has_access() to anon, authenticated;
+grant execute on function is_member() to anon, authenticated;
+grant execute on function is_admin()  to anon, authenticated;
+
+-- ---------------------------------------------------------------- rls
+
+alter table allowed_emails enable row level security;
+alter table profiles       enable row level security;
+alter table companies      enable row level security;
+alter table contacts       enable row level security;
+alter table activities     enable row level security;
+alter table tasks          enable row level security;
+
+-- Only admins manage the allowlist, and only from inside the app.
+create policy allowed_emails_admin on allowed_emails
+  for all using (is_admin()) with check (is_admin());
+
+create policy profiles_read on profiles
+  for select using (has_access());
+create policy profiles_self_update on profiles
+  for update using (id = auth.uid()) with check (id = auth.uid());
+
+-- The club shares one workspace: any member reads and writes any record. Deletes
+-- are narrower, since that's the operation you can't undo from the UI.
+do $$
+declare t text;
+begin
+  foreach t in array array['companies', 'contacts', 'activities', 'tasks'] loop
+    execute format('create policy %1$s_read on %1$s for select using (has_access())', t);
+    execute format('create policy %1$s_insert on %1$s for insert with check (is_member())', t);
+    execute format('create policy %1$s_update on %1$s for update using (is_member()) with check (is_member())', t);
+    execute format(
+      'create policy %1$s_delete on %1$s for delete using (is_admin() or created_by = auth.uid())', t);
+  end loop;
+end;
+$$;
+
+-- Companies are the exception: deleting one takes its contacts, activity and
+-- tasks with it, so only admins may. Everyone else files a request against
+-- deletion_requests below.
+drop policy if exists companies_delete on companies;
+create policy companies_delete on companies for delete using (is_admin());
+
+-- ------------------------------------------------- status history + assignment
+
+create table if not exists status_events (
+  id          uuid primary key default uuid_generate_v4(),
+  company_id  uuid not null references companies on delete cascade,
+  from_status text,
+  to_status   text not null,
+  changed_by  uuid references profiles on delete set null,
+  -- clock_timestamp(), not now(): now() is the transaction start time, so two
+  -- status changes in one transaction would share a timestamp and the history
+  -- would sort arbitrarily.
+  changed_at  timestamptz not null default clock_timestamp()
+);
+
+create index if not exists status_events_company_idx on status_events (company_id, changed_at desc);
+create index if not exists status_events_recent_idx  on status_events (changed_at desc);
+
+alter table status_events enable row level security;
+
+do $$
+begin
+  if not exists (select 1 from pg_policies where tablename='status_events' and policyname='status_events_read') then
+    create policy status_events_read on status_events for select using (has_access());
+  end if;
+  if not exists (select 1 from pg_policies where tablename='status_events' and policyname='status_events_insert') then
+    create policy status_events_insert on status_events for insert with check (is_member());
+  end if;
+end $$;
+
+-- Recorded by trigger, not application code, so a change is logged wherever it
+-- comes from — the UI, a bulk SQL update, anywhere.
+create or replace function log_status_change()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  if new.status is distinct from old.status then
+    insert into status_events (company_id, from_status, to_status, changed_by, changed_at)
+    values (new.id, old.status, new.status, auth.uid(), clock_timestamp());
+  end if;
+  return new;
+end;
+$$;
+
+revoke execute on function log_status_change() from anon, authenticated, public;
+
+drop trigger if exists companies_status_change on companies;
+create trigger companies_status_change
+  after update of status on companies
+  for each row execute function log_status_change();
+
+create index if not exists companies_owner_idx on companies (owner_id);
+create index if not exists tasks_assignee_idx  on tasks (assignee_id, done);
+
+-- ------------------------------------------------- role change safety
+-- RLS has no per-column granularity, so profiles_self_update would otherwise
+-- let a member set their own role to admin. Column privileges + a checked
+-- function close that.
+revoke update on public.profiles from authenticated;
+grant  update (full_name) on public.profiles to authenticated;
+
+create or replace function set_member_role(target uuid, new_role text)
+returns void
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+declare admins int;
+begin
+  if not is_admin() then
+    raise exception 'Only admins can change roles';
+  end if;
+  if new_role not in ('viewer', 'member', 'admin') then
+    raise exception 'Invalid role';
+  end if;
+
+  -- Never leave the club without an admin. Demoting to viewer counts too.
+  if new_role <> 'admin' then
+    select count(*) into admins from profiles where role = 'admin';
+    if admins <= 1 and (select role from profiles where id = target) = 'admin' then
+      raise exception 'Cannot remove the last admin';
+    end if;
+  end if;
+
+  update profiles set role = new_role where id = target;
+end;
+$$;
+
+grant execute on function set_member_role(uuid, text) to authenticated;
+
+-- ------------------------------------------------------------- last touch
+-- `updated_at` is the wrong signal for "has anyone talked to them lately" --
+-- fixing a typo in the notes bumps it, and so does a bulk status change. Track
+-- real contact separately, on both the company and the person, so a
+-- going-cold list means what it says.
+
+alter table companies add column if not exists last_touch_at timestamptz;
+alter table contacts  add column if not exists last_touch_at timestamptz;
+
+-- nulls first: never-touched is the coldest thing there is, and the index
+-- should hand those back at the front of the list rather than the end.
+create index if not exists companies_last_touch_idx on companies (last_touch_at nulls first);
+create index if not exists contacts_last_touch_idx  on contacts  (last_touch_at nulls first);
+
+-- By trigger rather than application code, so an activity logged from anywhere
+-- counts as a touch. The where clause stops a back-dated call from pulling a
+-- company's last touch backwards.
+create or replace function touch_last_contact()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  if new.company_id is not null then
+    update companies
+       set last_touch_at = new.occurred_at
+     where id = new.company_id
+       and coalesce(last_touch_at, '-infinity'::timestamptz) < new.occurred_at;
+  end if;
+
+  if new.contact_id is not null then
+    update contacts
+       set last_touch_at = new.occurred_at
+     where id = new.contact_id
+       and coalesce(last_touch_at, '-infinity'::timestamptz) < new.occurred_at;
+  end if;
+
+  return new;
+end;
+$$;
+
+revoke execute on function touch_last_contact() from anon, authenticated, public;
+
+drop trigger if exists activities_touch_contact on activities;
+create trigger activities_touch_contact
+  after insert or update of occurred_at on activities
+  for each row execute function touch_last_contact();
+
+-- ------------------------------------------------------------ saved views
+-- A filter combination someone worked out is worth keeping. Stored as the
+-- querystring, so a view needs no schema of its own and stays a plain link.
+
+create table if not exists saved_views (
+  id         uuid primary key default uuid_generate_v4(),
+  name       text not null,
+  path       text not null default '/companies',
+  query      text not null default '',
+  shared     boolean not null default true,
+  owner_id   uuid references profiles on delete cascade,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists saved_views_owner_idx on saved_views (owner_id);
+
+alter table saved_views enable row level security;
+
+do $$
+begin
+  if not exists (select 1 from pg_policies where tablename='saved_views' and policyname='saved_views_read') then
+    create policy saved_views_read on saved_views
+      for select using (has_access() and (shared or owner_id = auth.uid()));
+  end if;
+  -- owner_id must be the caller, or a member could file a view under someone
+  -- else's name and lock the real author out of their own row.
+  if not exists (select 1 from pg_policies where tablename='saved_views' and policyname='saved_views_insert') then
+    create policy saved_views_insert on saved_views
+      for insert with check (is_member() and owner_id = auth.uid());
+  end if;
+  if not exists (select 1 from pg_policies where tablename='saved_views' and policyname='saved_views_update') then
+    create policy saved_views_update on saved_views
+      for update using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+  end if;
+  if not exists (select 1 from pg_policies where tablename='saved_views' and policyname='saved_views_delete') then
+    create policy saved_views_delete on saved_views
+      for delete using (is_admin() or owner_id = auth.uid());
+  end if;
+end $$;
+
+-- --------------------------------------------------- sign-in email quota
+-- Supabase's default SMTP limits auth emails project-wide, not per user, and
+-- the limit cannot be raised without custom SMTP. This tracks every request
+-- and refuses the ones that would exceed it, so the failure is explained here
+-- rather than spent at Supabase and returned as a 429.
+-- See supabase/migrations/009_auth_email_quota.sql for the full reasoning.
+
+create table if not exists auth_email_requests (
+  id           uuid primary key default uuid_generate_v4(),
+  email        text not null,
+  -- 'pending' the moment it is claimed, 'sent' once the app confirms Supabase
+  -- accepted it, 'failed' if it didn't. See the counting rule below.
+  outcome      text not null default 'pending'
+               check (outcome in ('pending', 'sent', 'failed')),
+  -- Hashed and salted in the application, never the raw address. Null when
+  -- AUTH_RATE_SALT isn't configured, which switches per-IP capping off.
+  ip_hash      text,
+  requested_at timestamptz not null default now()
+);
+
+create index if not exists auth_email_requests_recent_idx
+  on auth_email_requests (requested_at desc);
+create index if not exists auth_email_requests_ip_idx
+  on auth_email_requests (ip_hash, requested_at desc) where ip_hash is not null;
+
+alter table auth_email_requests enable row level security;
+
+-- Deliberately NO policy for anon. The login page is unauthenticated and must
+-- never be able to read this table directly — the rows are club members' email
+-- addresses, and exposing them would turn the login page into a roster. All
+-- unauthenticated access goes through the security-definer functions below,
+-- which return counts and never addresses.
+do $$
+begin
+  if not exists (select 1 from pg_policies
+                  where tablename='auth_email_requests' and policyname='auth_email_requests_admin_read') then
+    create policy auth_email_requests_admin_read on auth_email_requests
+      for select using (is_admin());
+  end if;
+end $$;
+
+-- Supabase grants SELECT on new public tables to anon by default. RLS already
+-- blocks every row (no policy matches anon), but anon has no business reading
+-- this table at all and the security-definer functions below do not need the
+-- grant. `authenticated` keeps it — RLS narrows that to admins.
+--
+-- Note this is NOT the same as revoking EXECUTE on is_member()/is_admin(),
+-- which must keep their grants or every member query fails. See HANDOFF.md.
+revoke all on public.auth_email_requests from anon;
+
+-- ------------------------------------------------------------------ counting
+--
+-- A row counts against the quota if it was confirmed sent, OR if it is still
+-- pending and very recent.
+--
+-- That second clause is the interesting one. `claim_auth_email` is callable by
+-- anon — it has to be, the login page has no session — so someone could call it
+-- directly in a loop and mark the club's quota exhausted without a single email
+-- being sent, locking everyone out. Counting pending rows for only a minute
+-- caps that attack at a minute, and it self-heals with no cleanup job. A real
+-- sign-in confirms within a second, so the window never affects normal use.
+create or replace function auth_email_used(window_start timestamptz)
+returns int
+language sql
+stable
+security definer set search_path = public, pg_temp
+as $$
+  select count(*)::int
+    from auth_email_requests
+   where requested_at > window_start
+     and (outcome = 'sent'
+          or (outcome = 'pending' and requested_at > now() - interval '1 minute'));
+$$;
+
+revoke execute on function auth_email_used(timestamptz) from anon, authenticated, public;
+
+-- ------------------------------------------------------------------- reading
+-- Aggregate only: how many of the club's hourly allowance is gone, and when the
+-- next one frees up. No addresses, so this is safe to hand an anonymous page.
+create or replace function auth_email_quota()
+returns table (used int, quota int, retry_after timestamptz)
+language plpgsql
+stable
+security definer set search_path = public, pg_temp
+as $$
+declare
+  limit_per_hour constant int := 2;   -- keep in step with the dashboard
+  window_start timestamptz := now() - interval '1 hour';
+begin
+  return query
+  select
+    auth_email_used(window_start),
+    limit_per_hour,
+    (select min(requested_at) + interval '1 hour'
+       from auth_email_requests
+      where requested_at > window_start
+        and (outcome = 'sent'
+             or (outcome = 'pending' and requested_at > now() - interval '1 minute')));
+end;
+$$;
+
+grant execute on function auth_email_quota() to anon, authenticated;
+
+-- ------------------------------------------------------------------ claiming
+-- Reserves one of the hour's emails, or refuses. Returns the same shape either
+-- way so the caller can show the state without a second round trip.
+create or replace function claim_auth_email(p_email text, p_ip_hash text default null)
+returns table (allowed boolean, claim_id uuid, used int, quota int, retry_after timestamptz)
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+declare
+  limit_per_hour constant int := 2;    -- the club's shared allowance
+  ip_limit_per_hour constant int := 4; -- only applies when a hash is supplied
+  -- A ceiling on how many rows one hour can create at all, so hammering the
+  -- endpoint cannot grow the table without bound on a 500MB free tier.
+  insert_ceiling constant int := 200;
+  window_start timestamptz := now() - interval '1 hour';
+  v_used int;
+  v_retry timestamptz;
+  v_ip_used int;
+  v_rows_this_hour int;
+  v_id uuid;
+begin
+  if p_email is null or position('@' in p_email) = 0 then
+    raise exception 'A valid email address is required';
+  end if;
+
+  -- Housekeeping, cheap and inline: nothing older than a week is of any use and
+  -- this keeps the table permanently small.
+  delete from auth_email_requests where requested_at < now() - interval '7 days';
+
+  select auth_email_used(window_start) into v_used;
+
+  select min(requested_at) + interval '1 hour' into v_retry
+    from auth_email_requests
+   where requested_at > window_start
+     and (outcome = 'sent'
+          or (outcome = 'pending' and requested_at > now() - interval '1 minute'));
+
+  select count(*) into v_rows_this_hour
+    from auth_email_requests where requested_at > window_start;
+
+  if p_ip_hash is not null then
+    select count(*) into v_ip_used
+      from auth_email_requests
+     where ip_hash = p_ip_hash and requested_at > window_start;
+  else
+    v_ip_used := 0;
+  end if;
+
+  if v_used >= limit_per_hour
+     or v_ip_used >= ip_limit_per_hour
+     or v_rows_this_hour >= insert_ceiling then
+    -- Record the refusal, but as 'failed' so it never counts against the quota
+    -- itself — otherwise a burst of blocked attempts would extend the lockout.
+    if v_rows_this_hour < insert_ceiling then
+      insert into auth_email_requests (email, outcome, ip_hash)
+      values (lower(p_email), 'failed', p_ip_hash);
+    end if;
+
+    return query select false, null::uuid, v_used, limit_per_hour, v_retry;
+    return;
+  end if;
+
+  insert into auth_email_requests (email, outcome, ip_hash)
+  values (lower(p_email), 'pending', p_ip_hash)
+  returning id into v_id;
+
+  return query select true, v_id, v_used + 1, limit_per_hour,
+                      coalesce(v_retry, now() + interval '1 hour');
+end;
+$$;
+
+grant execute on function claim_auth_email(text, text) to anon, authenticated;
+
+-- ---------------------------------------------------------------- confirming
+-- Settles a claim once the app knows whether Supabase accepted it. A claim that
+-- failed is released rather than charged, so a typo or a network error doesn't
+-- cost the club one of its two.
+create or replace function settle_auth_email(p_claim_id uuid, p_sent boolean)
+returns void
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  update auth_email_requests
+     set outcome = case when p_sent then 'sent' else 'failed' end
+   where id = p_claim_id
+     and outcome = 'pending';
+end;
+$$;
+
+grant execute on function settle_auth_email(uuid, boolean) to anon, authenticated;
+
+-- -------------------------------------------------------- login tracking
+-- Supabase's own auth audit log is pruned (empty on a real project), and
+-- auth.users / auth.sessions aren't readable without a service-role key --
+-- which this app deliberately doesn't have. So it records its own.
+-- Counts sessions STARTED, where auth_email_requests counts links ASKED for;
+-- the gap between the two is the number worth looking at.
+
+create table if not exists login_events (
+  id         uuid primary key default uuid_generate_v4(),
+  profile_id uuid references profiles on delete set null,
+  email      text,
+  -- signed_in: a session was created and the user is a club member.
+  -- denied:    authenticated fine, but no profile -- i.e. not on the allowlist.
+  --            This is the allowlist doing its job, and worth seeing.
+  -- failed:    the link itself didn't work. Usually the PKCE verifier is missing
+  --            because the link was opened somewhere else.
+  -- signed_out: explicit sign-out.
+  event      text not null check (event in ('signed_in', 'denied', 'failed', 'signed_out')),
+  -- Which flow was used, so you can tell whether moving the email template to
+  -- /auth/confirm actually reduced the failures.
+  method     text check (method in ('pkce', 'token_hash', 'implicit', 'oauth', 'unknown')),
+  reason     text,
+  ip_hash    text,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists login_events_recent_idx  on login_events (created_at desc);
+create index if not exists login_events_profile_idx on login_events (profile_id, created_at desc);
+
+alter table login_events enable row level security;
+
+do $$
+begin
+  if not exists (select 1 from pg_policies
+                  where tablename='login_events' and policyname='login_events_admin_read') then
+    create policy login_events_admin_read on login_events
+      for select using (is_admin());
+  end if;
+end $$;
+
+-- Same reasoning as auth_email_requests: this holds email addresses and the
+-- write path has to be reachable before a session exists, so anon gets no
+-- direct access at all and goes through the function below.
+revoke all on public.login_events from anon;
+
+-- ------------------------------------------------------------------ recording
+--
+-- Callable by anon because a failed sign-in has no session by definition.
+-- Resolves the profile from auth.uid() when there is one, so the caller cannot
+-- claim to be somebody else -- the email argument is only used for the failure
+-- case, where nothing is authenticated yet and it is all we have.
+create or replace function record_login_event(
+  p_event   text,
+  p_method  text default 'unknown',
+  p_email   text default null,
+  p_reason  text default null,
+  p_ip_hash text default null
+)
+returns void
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+declare
+  -- Ceiling on rows per hour: this is an unauthenticated write path, so it must
+  -- not be able to grow the table without bound on a 500MB free tier.
+  insert_ceiling constant int := 500;
+  v_uid uuid := auth.uid();
+  v_rows_this_hour int;
+begin
+  if p_event not in ('signed_in', 'denied', 'failed', 'signed_out') then
+    return;  -- never raise: tracking must not be able to break sign-in
+  end if;
+
+  select count(*) into v_rows_this_hour
+    from login_events where created_at > now() - interval '1 hour';
+  if v_rows_this_hour >= insert_ceiling then
+    return;
+  end if;
+
+  delete from login_events where created_at < now() - interval '90 days';
+
+  insert into login_events (profile_id, email, event, method, reason, ip_hash)
+  values (
+    (select id from profiles where id = v_uid),
+    -- Prefer the authenticated identity; fall back to what was supplied.
+    coalesce((select email from profiles where id = v_uid), lower(nullif(trim(p_email), ''))),
+    p_event,
+    coalesce(nullif(p_method, ''), 'unknown'),
+    -- Truncated: Supabase error strings can be long and this is a label, not a log.
+    left(nullif(trim(p_reason), ''), 200),
+    p_ip_hash
+  );
+end;
+$$;
+
+grant execute on function record_login_event(text, text, text, text, text) to anon, authenticated;
+
+-- ------------------------------------------------------------ geocache
+-- Town-centre coordinates, one row per place name. Created here, before
+-- anything refers to it. See supabase/migrations/019_geocache_in_repo.sql.
+
+create table if not exists geocache (
+  place       text primary key,
+  latitude    double precision,
+  longitude   double precision,
+  county      text,
+  created_at  timestamptz not null default now()
+);
+
+alter table geocache enable row level security;
+
+do $$
+begin
+  if not exists (select 1 from pg_policies where tablename='geocache' and policyname='geocache_read') then
+    create policy geocache_read on geocache for select using ((select is_member()));
+  end if;
+  if not exists (select 1 from pg_policies where tablename='geocache' and policyname='geocache_write') then
+    create policy geocache_write on geocache for insert with check ((select is_member()));
+  end if;
+  if not exists (select 1 from pg_policies where tablename='geocache' and policyname='geocache_update') then
+    create policy geocache_update on geocache for update
+      using ((select is_member())) with check ((select is_member()));
+  end if;
+end $$;
+
+-- --------------------------------------------------------- map regions
+-- Groups companies into named areas for the map's zoomed-out view. Replace
+-- the rows in the function with your own regions -- see
+-- supabase/migrations/005_map_grouping.sql.
+
+alter table companies add column if not exists area text;
+create index if not exists companies_area_idx on companies (area);
+
+create or replace function ez_area(lat double precision, lon double precision)
+returns text
+language sql
+immutable
+as $$
+  select a.name
+  from (values
+    -- name,                     latitude, longitude
+    ('Metro Atlanta',            33.7550, -84.3900),
+    ('Northwest',                34.6000, -85.0000),
+    ('Northeast',                34.3500, -83.5500),
+    ('Athens Area',              33.9600, -83.3800),
+    ('Augusta / CSRA',           33.4700, -82.0000),
+    ('Columbus / West',          32.4600, -84.9900),
+    ('Middle',                   32.8400, -83.6300),
+    ('Southwest',                31.5800, -84.1600),
+    ('South',                    30.8300, -83.2800),
+    ('Southeast',                31.5000, -82.3000),
+    ('Savannah / Coastal',       32.0800, -81.0900),
+    ('Brunswick / Golden Isles', 31.1500, -81.4900)
+  ) as a(name, alat, alon)
+  where lat is not null and lon is not null
+  -- Planar approximation is plenty at this scale, and keeps the function
+  -- immutable so it can back an index or generated column later.
+  order by ((lat - a.alat) * 111) ^ 2 + ((lon - a.alon) * 93) ^ 2
+  limit 1;
+$$;
+
+-- ------------------------------------------------------- street geocoding
+-- Keeps "set the coordinates" and "recompute the area" from coming apart.
+-- Called only by the `geocode` Edge Function, which validates the point first.
+-- See supabase/migrations/011_set_company_point.sql.
+
+create or replace function set_company_point(p_id uuid, p_lat double precision, p_lon double precision)
+returns void
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  update companies
+     set latitude      = p_lat,
+         longitude     = p_lon,
+         geo_precision = 'address',
+         area          = ez_area(p_lat, p_lon)
+   where id = p_id;
+end;
+$$;
+
+revoke execute on function set_company_point(uuid, double precision, double precision)
+  from anon, authenticated, public;
+
+
+-- ------------------- deletions, the contact tree, and the activity feed
+-- Everything the club does to the data is recorded, deleting a company is a
+-- request members file rather than an act they perform, and contacts carry a
+-- reporting line. The roles and read policies these rely on are above; this is
+-- the part that adds new objects. See
+-- supabase/migrations/013_deletions_audit_roles_and_org_chart.sql.
+
+-- Deliberately NO foreign key to companies: the point is to outlive the
+-- company. `snapshot` keeps the row as it was, so an accidental deletion can be
+-- retyped from the log rather than reconstructed from memory.
+create table if not exists company_deletions (
+  id             uuid primary key default uuid_generate_v4(),
+  company_id     uuid not null,
+  company_name   text not null,
+  snapshot       jsonb not null,
+  deleted_by     uuid references profiles on delete set null,
+  deleted_at     timestamptz not null default clock_timestamp(),
+  -- Copied off the pending request as it cascades away, so the log can still
+  -- answer "who asked for this?" long after the request row is gone.
+  requested_by   uuid references profiles on delete set null,
+  request_reason text
+);
+
+create index if not exists company_deletions_recent_idx on company_deletions (deleted_at desc);
+
+alter table company_deletions enable row level security;
+
+do $$
+begin
+  -- Club-visible, like the status history: the log is only useful if the person
+  -- wondering where a company went can read it.
+  if not exists (select 1 from pg_policies
+                  where tablename='company_deletions' and policyname='company_deletions_read') then
+    create policy company_deletions_read on company_deletions for select using (has_access());
+  end if;
+end $$;
+
+-- No insert/update/delete policy at all: rows arrive only through the security
+-- definer trigger below. An append-only log nobody can edit.
+
+create table if not exists deletion_requests (
+  id            uuid primary key default uuid_generate_v4(),
+  -- Cascades: an approved request's company is gone, and so is the request.
+  -- What happened is recorded in company_deletions, which does not cascade.
+  company_id    uuid not null references companies on delete cascade,
+  requested_by  uuid references profiles on delete set null,
+  requested_at  timestamptz not null default now(),
+  reason        text,
+  status        text not null default 'pending'
+                  check (status in ('pending', 'declined', 'withdrawn')),
+  decided_by    uuid references profiles on delete set null,
+  decided_at    timestamptz,
+  decision_note text
+);
+
+-- One live request per company. A second member asking for the same deletion
+-- should join the existing request, not open a competing one.
+create unique index if not exists deletion_requests_one_pending
+  on deletion_requests (company_id) where status = 'pending';
+create index if not exists deletion_requests_recent_idx on deletion_requests (requested_at desc);
+
+alter table deletion_requests enable row level security;
+
+do $$
+begin
+  if not exists (select 1 from pg_policies
+                  where tablename='deletion_requests' and policyname='deletion_requests_read') then
+    create policy deletion_requests_read on deletion_requests for select using (has_access());
+  end if;
+
+  -- You can only file a request in your own name, and only as pending: an
+  -- already-decided request would be a decision nobody made.
+  if not exists (select 1 from pg_policies
+                  where tablename='deletion_requests' and policyname='deletion_requests_insert') then
+    create policy deletion_requests_insert on deletion_requests
+      for insert with check (is_member() and requested_by = auth.uid() and status = 'pending');
+  end if;
+
+  -- Withdrawing your own request is the only update a member can make directly.
+  -- An admin's decision goes through decide_deletion_request() below, so that
+  -- `decided_by` is whoever actually decided rather than whoever typed it.
+  if not exists (select 1 from pg_policies
+                  where tablename='deletion_requests' and policyname='deletion_requests_withdraw') then
+    create policy deletion_requests_withdraw on deletion_requests
+      for update using (requested_by = auth.uid() and status = 'pending')
+      with check (requested_by = auth.uid() and status = 'withdrawn');
+  end if;
+end $$;
+
+-- A trigger rather than application code, for the same reason status changes
+-- are: it fires wherever the delete comes from -- the UI, the SQL editor, a
+-- cascade -- and cannot be forgotten at a call site. BEFORE DELETE, so the
+-- pending request is still there to be read.
+create or replace function log_company_deletion()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+declare req record;
+begin
+  select requested_by, reason into req
+  from deletion_requests
+  where company_id = old.id and status = 'pending'
+  limit 1;
+
+  insert into company_deletions
+    (company_id, company_name, snapshot, deleted_by, requested_by, request_reason)
+  values
+    (old.id, old.name, to_jsonb(old), auth.uid(), req.requested_by, req.reason);
+
+  return old;
+end;
+$$;
+
+revoke execute on function log_company_deletion() from anon, authenticated, public;
+
+drop trigger if exists companies_deletion_log on companies;
+create trigger companies_deletion_log
+  before delete on companies
+  for each row execute function log_company_deletion();
+
+-- Declining is a write a member must not be able to forge, so it goes through a
+-- checked function -- the same shape as set_member_role(). Approving needs no
+-- function: an admin simply deletes the company, and the trigger above records
+-- the request that prompted it.
+create or replace function decide_deletion_request(request uuid, note text default null)
+returns void
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  if not is_admin() then
+    raise exception 'Only admins can decide deletion requests';
+  end if;
+
+  update deletion_requests
+     set status = 'declined',
+         decided_by = auth.uid(),
+         decided_at = now(),
+         decision_note = note
+   where id = request and status = 'pending';
+end;
+$$;
+
+revoke execute on function decide_deletion_request(uuid, text) from anon, public;
+grant execute on function decide_deletion_request(uuid, text) to authenticated;
+
+-- ======================================================= 4. the contact tree
+
+-- `reports_to` is a self-reference, which makes an org chart. `division` is free
+-- text, because a club cannot know in advance whether a company splits into
+-- Operations and Marketing or into North Plant and South Plant, and a fixed list
+-- would be wrong at the first company that does it differently.
+--
+-- on delete set null, not cascade: deleting a manager must orphan their reports
+-- upward, not delete the team.
+alter table contacts add column if not exists reports_to uuid references contacts(id) on delete set null;
+alter table contacts add column if not exists division text;
+
+create index if not exists contacts_reports_to_idx on contacts (reports_to);
+create index if not exists contacts_company_division_idx on contacts (company_id, division);
+
+create or replace function check_contact_reporting()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+declare
+  cursor_id uuid;
+  manager_company uuid;
+  hops int := 0;
+begin
+  if new.reports_to is null then
+    return new;
+  end if;
+
+  if new.reports_to = new.id then
+    raise exception 'A contact cannot report to themselves';
+  end if;
+
+  select company_id into manager_company from contacts where id = new.reports_to;
+
+  -- Both null (two unattached contacts) is fine; one null is not, and neither
+  -- is a mismatch. `is distinct from` handles the nulls without three branches.
+  if manager_company is distinct from new.company_id then
+    raise exception 'A contact can only report to someone at the same company';
+  end if;
+
+  -- Walk up from the proposed manager. Reaching this contact means the edit
+  -- would close a loop. The hop cap is a backstop: a cycle that already exists
+  -- in the data (from before this migration) would otherwise spin forever.
+  cursor_id := new.reports_to;
+  while cursor_id is not null and hops < 100 loop
+    if cursor_id = new.id then
+      raise exception 'That would create a reporting loop';
+    end if;
+    select reports_to into cursor_id from contacts where id = cursor_id;
+    hops := hops + 1;
+  end loop;
+
+  return new;
+end;
+$$;
+
+revoke execute on function check_contact_reporting() from anon, authenticated, public;
+
+drop trigger if exists contacts_reporting_check on contacts;
+create trigger contacts_reporting_check
+  before insert or update of reports_to, company_id on contacts
+  for each row execute function check_contact_reporting();
+-- ====================================================== 5. activity feed
+
+create table if not exists audit_events (
+  id         uuid primary key default uuid_generate_v4(),
+  -- clock_timestamp(), not now(): several events can share a transaction (a
+  -- bulk assign, a cascade) and now() would give them all one timestamp and an
+  -- arbitrary order.
+  at         timestamptz not null default clock_timestamp(),
+  -- Null when nobody was signed in -- the geocode function, a SQL editor
+  -- session. The UI says "automatically" rather than inventing a name.
+  actor      uuid references profiles on delete set null,
+  entity     text not null check (entity in ('company', 'contact', 'task', 'activity',
+                                            'deletion_request', 'member', 'data',
+                                            'template', 'setting')),
+  action     text not null check (action in (
+               'created', 'updated', 'deleted', 'status_changed', 'assigned',
+               'tier_changed', 'completed', 'reopened', 'requested', 'declined',
+               'withdrawn', 'invited', 'removed', 'role_changed', 'renamed',
+               'imported', 'exported')),
+  entity_id  uuid,
+  -- No foreign key, for the same reason company_deletions has none: an event
+  -- about a deleted company has to outlive the company.
+  company_id uuid,
+  summary    text not null,
+  details    jsonb
+);
+
+-- `create table if not exists` above does nothing when the table is already
+-- there, which means a database created before 'template' and 'setting' existed
+-- keeps the older CHECK and refuses those rows at runtime -- a trigger failing
+-- on a settings change, long after this file appeared to succeed. Reconciling
+-- explicitly is the only way an upgrade and a fresh install end up identical.
+alter table audit_events drop constraint if exists audit_events_entity_check;
+alter table audit_events add constraint audit_events_entity_check
+  check (entity in ('company', 'contact', 'task', 'activity',
+                    'deletion_request', 'member', 'data', 'template', 'setting'));
+
+alter table audit_events drop constraint if exists audit_events_action_check;
+alter table audit_events add constraint audit_events_action_check
+  check (action in ('created', 'updated', 'deleted', 'status_changed', 'assigned',
+                    'tier_changed', 'completed', 'reopened', 'requested', 'declined',
+                    'withdrawn', 'invited', 'removed', 'role_changed', 'renamed',
+                    'imported', 'exported'));
+
+create index if not exists audit_events_recent_idx  on audit_events (at desc);
+create index if not exists audit_events_company_idx on audit_events (company_id, at desc);
+create index if not exists audit_events_actor_idx   on audit_events (actor, at desc);
+
+alter table audit_events enable row level security;
+
+do $$
+begin
+  if not exists (select 1 from pg_policies
+                  where tablename='audit_events' and policyname='audit_events_read') then
+    create policy audit_events_read on audit_events for select using (has_access());
+  end if;
+end $$;
+
+-- Append-only: no insert/update/delete policy, so rows can only arrive through
+-- the security definer triggers below.
+
+create or replace function audit_log(
+  p_entity text, p_action text, p_entity_id uuid, p_company_id uuid,
+  p_summary text, p_details jsonb default null)
+returns void
+language sql
+security definer set search_path = public, pg_temp
+as $$
+  insert into audit_events (actor, entity, action, entity_id, company_id, summary, details)
+  values (auth.uid(), p_entity, p_action, p_entity_id, p_company_id, p_summary, p_details);
+$$;
+
+revoke execute on function audit_log(text, text, uuid, uuid, text, jsonb) from anon, authenticated, public;
+
+-- Columns the database maintains for itself. An event for each of these would
+-- mean every logged call also produced "someone updated this company", which is
+-- noise standing exactly where the signal should be.
+create or replace function audit_ignored_column(col text)
+returns boolean
+language sql
+immutable
+as $$
+  select col in ('updated_at', 'last_touch_at', 'tier_rank', 'area', 'geo_precision');
+$$;
+
+-- Which real fields changed, as a text[] -- for the "edited (city, phone)" tail
+-- that makes an update event worth reading.
+create or replace function audit_changed_fields(before jsonb, after jsonb)
+returns text[]
+language sql
+immutable
+as $$
+  select coalesce(array_agg(key order by key), '{}')
+  from jsonb_each(after)
+  where not audit_ignored_column(key)
+    and value is distinct from (before -> key);
+$$;
+
+create or replace function audit_company()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+declare changed text[];
+begin
+  if tg_op = 'INSERT' then
+    perform audit_log('company', 'created', new.id, new.id,
+                      format('Added %s', new.name),
+                      jsonb_build_object('status', new.status, 'tier', new.tier));
+
+  elsif tg_op = 'DELETE' then
+    perform audit_log('company', 'deleted', old.id, old.id,
+                      format('Deleted %s', old.name), null);
+
+  else
+    -- Status, owner and tier get their own actions: they are the three things
+    -- people scan a feed for, and "edited" would hide them among the rest.
+    if new.status is distinct from old.status then
+      -- Written as words, not as the stored enum: this sentence is read by
+      -- people, and "in_conversation" is a column value, not English.
+      perform audit_log('company', 'status_changed', new.id, new.id,
+                        format('%s: %s → %s', new.name,
+                               initcap(replace(old.status, '_', ' ')),
+                               initcap(replace(new.status, '_', ' '))),
+                        jsonb_build_object('from', old.status, 'to', new.status));
+    end if;
+
+    if new.owner_id is distinct from old.owner_id then
+      perform audit_log('company', 'assigned', new.id, new.id,
+        case
+          when new.owner_id is null then format('Unassigned %s', new.name)
+          else format('Assigned %s to %s', new.name,
+                      coalesce((select coalesce(full_name, email) from profiles where id = new.owner_id), 'someone'))
+        end,
+        jsonb_build_object('from', old.owner_id, 'to', new.owner_id));
+    end if;
+
+    if new.tier is distinct from old.tier then
+      perform audit_log('company', 'tier_changed', new.id, new.id,
+                        format('%s: %s', new.name, coalesce(new.tier, 'unrated')),
+                        jsonb_build_object('from', old.tier, 'to', new.tier));
+    end if;
+
+    -- Everything else, as one event listing the fields.
+    changed := audit_changed_fields(to_jsonb(old), to_jsonb(new));
+    changed := array_remove(array_remove(array_remove(changed, 'status'), 'owner_id'), 'tier');
+
+    if array_length(changed, 1) > 0 then
+      perform audit_log('company', 'updated', new.id, new.id,
+                        format('Edited %s (%s)', new.name, array_to_string(changed, ', ')),
+                        jsonb_build_object('fields', changed));
+    end if;
+  end if;
+
+  return coalesce(new, old);
+end;
+$$;
+
+revoke execute on function audit_company() from anon, authenticated, public;
+
+drop trigger if exists companies_audit on companies;
+create trigger companies_audit
+  after insert or update or delete on companies
+  for each row execute function audit_company();
+
+-- A company delete cascades to its contacts, activities and tasks. Auditing
+-- each of those would turn one deliberate act into thirty lines of feed, all
+-- saying something the "Deleted X" line above already said. So the child
+-- triggers stay quiet when their company has just gone: inside the cascade the
+-- parent row is already deleted, which is exactly what this checks.
+create or replace function audit_parent_gone(p_company_id uuid)
+returns boolean
+language sql
+security definer set search_path = public, pg_temp
+stable
+as $$
+  select p_company_id is not null and not exists (select 1 from companies where id = p_company_id);
+$$;
+
+revoke execute on function audit_parent_gone(uuid) from anon, authenticated, public;
+
+------------------------------------------------------------------- the feed
+--
+-- "Edited contact Priya Nair (reports_to)" is
+-- true and unreadable -- a uuid column name where a person's name belongs -- so
+-- reporting and division changes get their own sentences.
+create or replace function audit_contact()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+declare
+  who text;
+  changed text[];
+  manager text;
+begin
+  if tg_op = 'DELETE' then
+    if audit_parent_gone(old.company_id) then return old; end if;
+    who := trim(concat_ws(' ', old.first_name, old.last_name));
+    perform audit_log('contact', 'deleted', old.id, old.company_id,
+                      format('Removed contact %s', who), null);
+    return old;
+  end if;
+
+  who := trim(concat_ws(' ', new.first_name, new.last_name));
+
+  if tg_op = 'INSERT' then
+    perform audit_log('contact', 'created', new.id, new.company_id,
+                      format('Added contact %s', who),
+                      jsonb_build_object('title', new.title, 'division', new.division));
+    return new;
+  end if;
+
+  if new.reports_to is distinct from old.reports_to then
+    select trim(concat_ws(' ', first_name, last_name)) into manager
+    from contacts where id = new.reports_to;
+
+    perform audit_log('contact', 'updated', new.id, new.company_id,
+      case
+        when manager is null then format('%s no longer reports to anyone', who)
+        else format('%s now reports to %s', who, manager)
+      end,
+      jsonb_build_object('from', old.reports_to, 'to', new.reports_to));
+  end if;
+
+  if new.division is distinct from old.division then
+    perform audit_log('contact', 'updated', new.id, new.company_id,
+      case
+        when new.division is null then format('%s is no longer in a division', who)
+        else format('%s moved to %s', who, new.division)
+      end,
+      jsonb_build_object('from', old.division, 'to', new.division));
+  end if;
+
+  -- Everything else, as one event listing the fields.
+  changed := audit_changed_fields(to_jsonb(old), to_jsonb(new));
+  changed := array_remove(array_remove(changed, 'reports_to'), 'division');
+
+  if array_length(changed, 1) > 0 then
+    perform audit_log('contact', 'updated', new.id, new.company_id,
+                      format('Edited contact %s (%s)', who, array_to_string(changed, ', ')),
+                      jsonb_build_object('fields', changed));
+  end if;
+
+  return new;
+end;
+$$;
+
+revoke execute on function audit_contact() from anon, authenticated, public;
+
+drop trigger if exists contacts_audit on contacts;
+create trigger contacts_audit
+  after insert or update or delete on contacts
+  for each row execute function audit_contact();
+
+create or replace function audit_task()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  if tg_op = 'DELETE' then
+    if audit_parent_gone(old.company_id) then return old; end if;
+    perform audit_log('task', 'deleted', old.id, old.company_id,
+                      format('Deleted task: %s', old.title), null);
+    return old;
+  end if;
+
+  if tg_op = 'INSERT' then
+    perform audit_log('task', 'created', new.id, new.company_id,
+                      format('Added task: %s', new.title),
+                      jsonb_build_object('due_date', new.due_date));
+
+  elsif new.done is distinct from old.done then
+    -- Ticking a task off is the single most common write in the app, and the
+    -- one people most want to see happening.
+    perform audit_log('task', case when new.done then 'completed' else 'reopened' end,
+                      new.id, new.company_id,
+                      format('%s: %s', case when new.done then 'Completed' else 'Reopened' end, new.title),
+                      null);
+
+  elsif array_length(audit_changed_fields(to_jsonb(old), to_jsonb(new)), 1) > 0 then
+    perform audit_log('task', 'updated', new.id, new.company_id,
+                      format('Edited task: %s', new.title), null);
+  end if;
+
+  return new;
+end;
+$$;
+
+revoke execute on function audit_task() from anon, authenticated, public;
+
+drop trigger if exists tasks_audit on tasks;
+create trigger tasks_audit
+  after insert or update or delete on tasks
+  for each row execute function audit_task();
+
+-- The manual log is itself an action: "Ada logged a call" belongs in the same
+-- stream as "Ada finished a task", even though the call already has its own row.
+create or replace function audit_activity()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  if tg_op = 'DELETE' then
+    if audit_parent_gone(old.company_id) then return old; end if;
+    perform audit_log('activity', 'deleted', old.id, old.company_id,
+                      format('Deleted %s log: %s', old.type, coalesce(old.subject, 'note')), null);
+    return old;
+  end if;
+
+  perform audit_log('activity', 'created', new.id, new.company_id,
+                    format('Logged %s: %s', new.type, coalesce(new.subject, 'note')),
+                    jsonb_build_object('type', new.type));
+  return new;
+end;
+$$;
+
+revoke execute on function audit_activity() from anon, authenticated, public;
+
+drop trigger if exists activities_audit on activities;
+create trigger activities_audit
+  after insert or delete on activities
+  for each row execute function audit_activity();
+
+create or replace function audit_deletion_request()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+declare co text;
+begin
+  select name into co from companies where id = new.company_id;
+
+  if tg_op = 'INSERT' then
+    perform audit_log('deletion_request', 'requested', new.id, new.company_id,
+                      format('Requested deletion of %s', coalesce(co, 'a company')),
+                      jsonb_build_object('reason', new.reason));
+
+  elsif new.status is distinct from old.status and new.status in ('declined', 'withdrawn') then
+    perform audit_log('deletion_request', new.status, new.id, new.company_id,
+                      format('%s the deletion request for %s',
+                             initcap(new.status), coalesce(co, 'a company')),
+                      jsonb_build_object('note', new.decision_note));
+  end if;
+
+  return new;
+end;
+$$;
+
+revoke execute on function audit_deletion_request() from anon, authenticated, public;
+
+drop trigger if exists deletion_requests_audit on deletion_requests;
+create trigger deletion_requests_audit
+  after insert or update on deletion_requests
+  for each row execute function audit_deletion_request();
+
+-- ------------------------------------------------------------------- members
+
+-- The allowlist is the actual gate: an address on it can sign in, one off it
+-- cannot. Both directions are worth a line in the feed.
+create or replace function audit_allowed_email()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  if tg_op = 'INSERT' then
+    perform audit_log('member', 'invited', null, null,
+                      format('Invited %s as %s', new.email, new.role),
+                      jsonb_build_object('email', new.email, 'role', new.role, 'note', new.note));
+  else
+    perform audit_log('member', 'removed', null, null,
+                      format('Removed %s from the allowlist', old.email),
+                      jsonb_build_object('email', old.email));
+  end if;
+
+  return coalesce(new, old);
+end;
+$$;
+
+revoke execute on function audit_allowed_email() from anon, authenticated, public;
+
+drop trigger if exists allowed_emails_audit on allowed_emails;
+create trigger allowed_emails_audit
+  after insert or delete on allowed_emails
+  for each row execute function audit_allowed_email();
+
+create or replace function audit_profile()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  if tg_op = 'INSERT' then
+    -- Not a sign-in: this fires once, when an invited address first becomes a
+    -- real account. The sign-ins themselves stay in login_events.
+    perform audit_log('member', 'created', new.id, null,
+                      format('%s joined as %s', coalesce(new.full_name, new.email), new.role),
+                      jsonb_build_object('email', new.email, 'role', new.role));
+
+  elsif tg_op = 'DELETE' then
+    perform audit_log('member', 'removed', old.id, null,
+                      format('%s lost access', coalesce(old.full_name, old.email)),
+                      jsonb_build_object('email', old.email));
+
+  else
+    if new.role is distinct from old.role then
+      perform audit_log('member', 'role_changed', new.id, null,
+                        format('%s is now %s (was %s)',
+                               coalesce(new.full_name, new.email), new.role, old.role),
+                        jsonb_build_object('from', old.role, 'to', new.role));
+    end if;
+
+    -- Worth recording so a name appearing on old activity can be explained,
+    -- but not worth a line when it is first set from nothing.
+    if new.full_name is distinct from old.full_name and old.full_name is not null then
+      perform audit_log('member', 'renamed', new.id, null,
+                        format('%s is now called %s', old.full_name,
+                               coalesce(new.full_name, new.email)),
+                        jsonb_build_object('from', old.full_name, 'to', new.full_name));
+    end if;
+  end if;
+
+  return coalesce(new, old);
+end;
+$$;
+
+revoke execute on function audit_profile() from anon, authenticated, public;
+
+drop trigger if exists profiles_audit on profiles;
+create trigger profiles_audit
+  after insert or update or delete on profiles
+  for each row execute function audit_profile();
+
+-- --------------------------------------------------------- imports & exports
+
+-- Called by the application, not by a trigger, and this is the one place that
+-- is right: an export is a SELECT, so there is nothing for a trigger to fire
+-- on, and an import is one deliberate act that happens to be a thousand
+-- inserts. The app knows both facts; the table does not.
+--
+-- has_access(), not is_member(): a viewer may export -- reading is what the
+-- role is for -- and the point of the log is that we can see they did.
+-- p_rows is clamped and the label is whitelisted, so a caller cannot write an
+-- arbitrary sentence into the club's audit trail.
+create or replace function log_data_transfer(p_action text, p_table text, p_rows int)
+returns void
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+declare verb text;
+begin
+  if not has_access() then
+    raise exception 'Not a member';
+  end if;
+  if p_action not in ('imported', 'exported') then
+    raise exception 'Invalid transfer action';
+  end if;
+  if p_table not in ('companies', 'contacts', 'activities') then
+    raise exception 'Unknown table';
+  end if;
+
+  verb := case p_action when 'imported' then 'Imported' else 'Exported' end;
+
+  perform audit_log('data', p_action, null, null,
+                    format('%s %s %s', verb, greatest(coalesce(p_rows, 0), 0), p_table),
+                    jsonb_build_object('table', p_table, 'rows', greatest(coalesce(p_rows, 0), 0)));
+end;
+$$;
+
+revoke execute on function log_data_transfer(text, text, int) from anon, public;
+grant execute on function log_data_transfer(text, text, int) to authenticated;
+
+
+-- ========================================================== 6. settings
+
+-- Key/value rather than a column per setting: these are read as a whole by one
+-- page and never queried across, so a table that needs a migration for every new
+-- preference buys nothing. Members read; only admins change club-wide settings,
+-- because they appear in everybody's outgoing mail.
+create table if not exists settings (
+  key        text primary key,
+  value      jsonb not null,
+  updated_by uuid references profiles on delete set null,
+  updated_at timestamptz not null default now()
+);
+
+alter table settings enable row level security;
+
+do $$
+begin
+  if not exists (select 1 from pg_policies where tablename='settings' and policyname='settings_read') then
+    create policy settings_read on settings for select using (has_access());
+  end if;
+  if not exists (select 1 from pg_policies where tablename='settings' and policyname='settings_write') then
+    create policy settings_write on settings for all using (is_admin()) with check (is_admin());
+  end if;
+end $$;
+
+-- /privacy and /terms are public -- Google's OAuth reviewer fetches them, and a
+-- policy behind a login is worth nothing to the person it is written for. They
+-- name the club and give a contact address, and both now come from this row
+-- rather than from the source, so a public repository carries neither.
+--
+-- Only this one key is readable without a session. NOTHING PRIVATE GOES IN THE
+-- 'club' ROW: it is, by design, world-readable. Any other key stays behind
+-- has_access() through the policy above.
+do $$
+begin
+  if not exists (select 1 from pg_policies where tablename='settings' and policyname='settings_public_club') then
+    create policy settings_public_club on settings for select using (key = 'club');
+  end if;
+end $$;
+
+-- The club's own details, merged into every outgoing draft. Seeded with visible
+-- placeholders on purpose: a draft that says [YOUR CLUB] is obviously
+-- unfinished, whereas one that says "the Engineering Society" is wrong in a way
+-- somebody will send by accident.
+insert into settings (key, value)
+values ('club', jsonb_build_object(
+  'clubName', '[YOUR CLUB]',
+  'school', '[YOUR SCHOOL]',
+  'groupSize', '[GROUP SIZE]',
+  'visitLength', '[LENGTH]',
+  -- Shown on /privacy and /terms as the address to write to. Public.
+  'contactEmail', ''
+))
+on conflict (key) do nothing;
+
+-- The standard letters. Bodies carry {{merge_fields}} filled in per company at
+-- draft time -- lib/cold-email.ts lists them and is the only place that knows
+-- what each one means.
+create table if not exists email_templates (
+  id          uuid primary key default uuid_generate_v4(),
+  slug        text not null unique,
+  name        text not null,
+  -- When to reach for it. Shown under the picker, so it is guidance for the
+  -- member choosing rather than part of the letter.
+  guidance    text,
+  subject     text not null,
+  body        text not null,
+  sort        int not null default 100,
+  -- Offered first for companies at this status. Null means never suggested,
+  -- only chosen by hand.
+  suggest_for text,
+  created_by  uuid references profiles on delete set null,
+  updated_by  uuid references profiles on delete set null,
+  updated_at  timestamptz not null default now(),
+  created_at  timestamptz not null default now()
+);
+
+create index if not exists email_templates_sort_idx on email_templates (sort, name);
+
+alter table email_templates enable row level security;
+
+do $$
+begin
+  if not exists (select 1 from pg_policies where tablename='email_templates' and policyname='email_templates_read') then
+    create policy email_templates_read on email_templates for select using (has_access());
+  end if;
+  -- Any member may improve a letter: they are the ones sending them, and every
+  -- edit lands in the activity feed with a name against it.
+  if not exists (select 1 from pg_policies where tablename='email_templates' and policyname='email_templates_insert') then
+    create policy email_templates_insert on email_templates for insert with check (is_member());
+  end if;
+  if not exists (select 1 from pg_policies where tablename='email_templates' and policyname='email_templates_update') then
+    create policy email_templates_update on email_templates for update using (is_member()) with check (is_member());
+  end if;
+  -- Deleting the club's standard letter is the one that deserves a second thought.
+  if not exists (select 1 from pg_policies where tablename='email_templates' and policyname='email_templates_delete') then
+    create policy email_templates_delete on email_templates for delete using (is_admin() or created_by = auth.uid());
+  end if;
+end $$;
+
+create or replace function touch_email_template()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  new.updated_at := now();
+  new.updated_by := auth.uid();
+  return new;
+end;
+$$;
+
+revoke execute on function touch_email_template() from anon, authenticated, public;
+
+drop trigger if exists email_templates_touch on email_templates;
+create trigger email_templates_touch
+  before update on email_templates
+  for each row execute function touch_email_template();
+
+-- One function for both tables: the shapes differ but the sentence does not,
+-- and two nearly identical trigger functions would drift apart.
+create or replace function audit_settings()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  if tg_table_name = 'settings' then
+    perform audit_log('setting', 'updated', null, null,
+                      format('Changed the %s settings', coalesce(new.key, old.key)), null);
+    return coalesce(new, old);
+  end if;
+
+  if tg_op = 'INSERT' then
+    perform audit_log('template', 'created', new.id, null,
+                      format('Added the "%s" email template', new.name), null);
+  elsif tg_op = 'DELETE' then
+    perform audit_log('template', 'deleted', old.id, null,
+                      format('Deleted the "%s" email template', old.name), null);
+  elsif new.subject is distinct from old.subject or new.body is distinct from old.body
+     or new.name is distinct from old.name or new.guidance is distinct from old.guidance then
+    perform audit_log('template', 'updated', new.id, null,
+                      format('Edited the "%s" email template', new.name), null);
+  end if;
+
+  return coalesce(new, old);
+end;
+$$;
+
+revoke execute on function audit_settings() from anon, authenticated, public;
+
+drop trigger if exists settings_audit on settings;
+create trigger settings_audit
+  after insert or update on settings
+  for each row execute function audit_settings();
+
+drop trigger if exists email_templates_audit on email_templates;
+create trigger email_templates_audit
+  after insert or update or delete on email_templates
+  for each row execute function audit_settings();
+
+-- The four letters, as skeletons rather than finished writing.
+--
+-- What a club actually sends is its own voice, tuned over a season, and it
+-- promises specific things: how many students, how long, what you will sign.
+-- Shipping one club's letters as another club's default is how a group ends up
+-- sending a stranger a promise it never made. So these carry the shape, the
+-- merge fields and square-bracket prompts, and the writing is yours.
+--
+-- Edit them at /settings once this is applied, or paste a set you already have
+-- into the Markdown import there. supabase/email-templates.example.md shows the
+-- format. A re-run never overwrites what somebody has since changed.
+insert into email_templates (slug, name, guidance, subject, body, sort, suggest_for)
+values
+  ('tour', 'Ask for a tour', 'First approach, when you want to visit.',
+   'Student visit to {{company}}?', E'{{greeting}}\n\nI am {{my_name}}, from {{club}} at {{school}}. [Say in a sentence who you are and why a visit is worth their morning.]\n\nI am writing to ask whether {{company}} would consider hosting us at {{site}}. We are interested in your work in {{what_they_do}}.\n\nWhat we would ask for:\n\n- About {{group_size}} students, plus one member of staff\n- Roughly {{visit_length}}, on a weekday that suits you\n- [Anything else you need]\n\n[What you bring: briefed students, whatever agreement you will sign, how you handle photographs.]\n\nWould you be open to it?\n\nThank you for your time,\n{{signature}}', 10, 'prospect'),
+  ('sponsorship', 'Ask for sponsorship', 'First approach, when you want support.',
+   '{{club}} at {{school}} — supporting {{group_size}} students', E'{{greeting}}\n\nI am {{my_name}}, writing on behalf of {{club}} at {{school}}. We are a student group of about {{group_size}}.\n\n[What the money or the help would pay for, and what a supporter gets in return.]\n\nI am contacting {{company}} because of your work in {{what_they_do}}.\n\n[Your ask, in one sentence.]\n\nThank you for reading,\n{{signature}}', 20, null),
+  ('nudge', 'Nudge after silence', 'You wrote, nobody replied, it has been a fortnight.',
+   'Following up: visiting {{company}}', E'{{greeting}}\n\nI wrote a couple of weeks ago about bringing a group of students from {{club}} at {{school}} to {{site}}, and I know a message like mine is easy to lose.\n\n[Make it easy to say no — that is what gets you an answer.]\n\nThanks either way,\n{{signature}}', 30, 'contacted'),
+  ('reintro', 'New year, new committee', 'They hosted before, and the committee has changed.',
+   '{{club}} — new committee, saying hello again', E'{{greeting}}\n\n{{company}} has worked with {{club}} at {{school}} before, and I wanted to reintroduce us: the committee changes every year, and I am this year''s.\n\n[Ask whether they are still willing, and give them an easy way out if not.]\n\nBest wishes,\n{{signature}}', 40, 'dormant')
+on conflict (slug) do nothing;
+
+
+-- ------------------- money, archiving, handoff, attachments, stage gate
+-- See supabase/migrations/014_money_archiving_attachments.sql.
+
+alter table companies add column if not exists amount numeric(12,2);
+alter table companies add column if not exists close_date date;
+alter table companies add column if not exists archived_at timestamptz;
+create index if not exists companies_amount_idx on companies (amount desc nulls last);
+create index if not exists companies_archived_idx on companies (archived_at);
+
+/**
+ * Move one member's work to another, in one statement.
+ *
+ * Removing somebody without moving their companies is the mistake this exists
+ * to prevent: their rows keep an owner_id that no longer resolves to anyone,
+ * and nobody notices until a going-cold list is quietly wrong. Admin-only, and
+ * checked here rather than trusted from the caller, because it rewrites other
+ * people's assignments.
+ */
+create or replace function reassign_member(from_member uuid, to_member uuid)
+returns jsonb
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+declare
+  moved_companies int;
+  moved_tasks int;
+begin
+  if not is_admin() then
+    raise exception 'Only admins can reassign work';
+  end if;
+  if from_member is null then
+    raise exception 'Nobody to reassign from';
+  end if;
+  if from_member = to_member then
+    raise exception 'That is the same person';
+  end if;
+  -- to_member may be null: "unassign everything" is a legitimate handoff when
+  -- the work is going back into the pool rather than to a named successor.
+  if to_member is not null and not exists (select 1 from profiles where id = to_member) then
+    raise exception 'That member does not exist';
+  end if;
+
+  update companies set owner_id = to_member where owner_id = from_member;
+  get diagnostics moved_companies = row_count;
+
+  update tasks set assignee_id = to_member where assignee_id = from_member and not done;
+  get diagnostics moved_tasks = row_count;
+
+  return jsonb_build_object('companies', moved_companies, 'tasks', moved_tasks);
+end;
+$$;
+
+revoke execute on function reassign_member(uuid, uuid) from anon, public;
+grant execute on function reassign_member(uuid, uuid) to authenticated;
+
+-- ======================================================== 3. stage gate
+
+/**
+ * "Committed" has to mean something.
+ *
+ * A company cannot reach committed without a named contact and a date, because
+ * the pipeline chart is read as a promise about the season and a committed row
+ * with nobody's name on it is how that promise quietly becomes false.
+ *
+ * Deliberately only this one transition. Gating every stage would turn a
+ * two-second status change into a form, which is how people stop updating
+ * statuses at all.
+ */
+create or replace function check_committed_ready()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  if new.status = 'committed' and (tg_op = 'INSERT' or old.status is distinct from 'committed') then
+    if new.close_date is null then
+      raise exception 'Set the date before marking % committed', new.name
+        using hint = 'A committed company needs a date in Edit → Close date.';
+    end if;
+    if not exists (select 1 from contacts where company_id = new.id) then
+      raise exception 'Add a contact before marking % committed', new.name
+        using hint = 'Somebody at the company has to be the person who said yes.';
+    end if;
+  end if;
+
+  return new;
+end;
+$$;
+
+revoke execute on function check_committed_ready() from anon, authenticated, public;
+
+drop trigger if exists companies_committed_gate on companies;
+create trigger companies_committed_gate
+  before insert or update of status on companies
+  for each row execute function check_committed_ready();
+
+-- ======================================================= 4. attachments
+
+-- The index; the files themselves live in Storage. A club's signed agreements
+-- currently live in one member's Drive and leave with them when they graduate.
+create table if not exists attachments (
+  id          uuid primary key default uuid_generate_v4(),
+  company_id  uuid not null references companies on delete cascade,
+  name        text not null,
+  -- Path inside the private bucket. Never guessable, never public: reads go
+  -- through a short-lived signed URL minted for a member.
+  path        text not null unique,
+  mime        text,
+  size_bytes  bigint,
+  created_by  uuid references profiles on delete set null,
+  created_at  timestamptz not null default now()
+);
+
+create index if not exists attachments_company_idx on attachments (company_id, created_at desc);
+
+alter table attachments enable row level security;
+
+do $$
+begin
+  if not exists (select 1 from pg_policies where tablename='attachments' and policyname='attachments_read') then
+    create policy attachments_read on attachments for select using (has_access());
+  end if;
+  if not exists (select 1 from pg_policies where tablename='attachments' and policyname='attachments_insert') then
+    create policy attachments_insert on attachments for insert with check (is_member());
+  end if;
+  if not exists (select 1 from pg_policies where tablename='attachments' and policyname='attachments_delete') then
+    create policy attachments_delete on attachments for delete using (is_admin() or created_by = auth.uid());
+  end if;
+end $$;
+
+-- The bucket. Private, and it must stay private: a public bucket makes every
+-- signed agreement readable by anyone who can guess a path.
+insert into storage.buckets (id, name, public, file_size_limit)
+values ('attachments', 'attachments', false, 10485760)
+on conflict (id) do nothing;
+
+-- Storage policies live on storage.objects, so every clause needs
+-- `bucket_id = 'attachments'` or it leaks across buckets. The pg_policies guard
+-- needs schemaname = 'storage' for the same reason.
+do $$
+begin
+  if not exists (select 1 from pg_policies
+                  where schemaname='storage' and tablename='objects' and policyname='attachments_read') then
+    create policy attachments_read on storage.objects
+      for select using (bucket_id = 'attachments' and has_access());
+  end if;
+  if not exists (select 1 from pg_policies
+                  where schemaname='storage' and tablename='objects' and policyname='attachments_write') then
+    create policy attachments_write on storage.objects
+      for insert with check (bucket_id = 'attachments' and is_member());
+  end if;
+  if not exists (select 1 from pg_policies
+                  where schemaname='storage' and tablename='objects' and policyname='attachments_remove') then
+    create policy attachments_remove on storage.objects
+      for delete using (bucket_id = 'attachments' and is_member());
+  end if;
+end $$;
+
+-- ============================================================ 5. audit
+
+alter table audit_events drop constraint if exists audit_events_entity_check;
+alter table audit_events add constraint audit_events_entity_check
+  check (entity in ('company', 'contact', 'task', 'activity',
+                    'deletion_request', 'member', 'data', 'template', 'setting',
+                    'attachment'));
+
+alter table audit_events drop constraint if exists audit_events_action_check;
+alter table audit_events add constraint audit_events_action_check
+  check (action in ('created', 'updated', 'deleted', 'status_changed', 'assigned',
+                    'tier_changed', 'completed', 'reopened', 'requested', 'declined',
+                    'withdrawn', 'invited', 'removed', 'role_changed', 'renamed',
+                    'imported', 'exported', 'archived', 'restored', 'uploaded'));
+
+create or replace function audit_attachment()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  if tg_op = 'DELETE' then
+    if audit_parent_gone(old.company_id) then return old; end if;
+    perform audit_log('attachment', 'deleted', old.id, old.company_id,
+                      format('Deleted the file %s', old.name), null);
+    return old;
+  end if;
+
+  perform audit_log('attachment', 'uploaded', new.id, new.company_id,
+                    format('Uploaded %s', new.name),
+                    jsonb_build_object('bytes', new.size_bytes));
+  return new;
+end;
+$$;
+
+revoke execute on function audit_attachment() from anon, authenticated, public;
+
+drop trigger if exists attachments_audit on attachments;
+create trigger attachments_audit
+  after insert or delete on attachments
+  for each row execute function audit_attachment();
+
+-- Archiving is a status-shaped act, so it reads as its own line in the feed
+-- rather than as "Edited X (archived_at)".
+create or replace function audit_company_archive()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  if new.archived_at is distinct from old.archived_at then
+    perform audit_log('company',
+                      case when new.archived_at is null then 'restored' else 'archived' end,
+                      new.id, new.id,
+                      format('%s %s', case when new.archived_at is null then 'Restored' else 'Archived' end, new.name),
+                      null);
+  end if;
+  return new;
+end;
+$$;
+
+revoke execute on function audit_company_archive() from anon, authenticated, public;
+
+drop trigger if exists companies_archive_audit on companies;
+create trigger companies_archive_audit
+  after update of archived_at on companies
+  for each row execute function audit_company_archive();
+
+-- `archived_at` is machine-ish bookkeeping as far as the generic edit event is
+-- concerned: without this, archiving something also logs "Edited X (archived_at)".
+create or replace function audit_ignored_column(col text)
+returns boolean
+language sql
+immutable
+as $$
+  select col in ('updated_at', 'last_touch_at', 'tier_rank', 'area', 'geo_precision', 'archived_at');
+$$;
+
+
+-- ================================================ multiple locations
+-- A company has places, not a place. Mirrored from
+-- supabase/migrations/015_company_locations.sql -- which is also why the
+-- location columns created on `companies` above are dropped at the end of this
+-- section: the two files have to land on the same schema, and the migration is
+-- the one that runs against a database that already has them.
+
+-- ======================================================== 1. the table
+
+create table if not exists company_locations (
+  id          uuid primary key default uuid_generate_v4(),
+  company_id  uuid not null references companies on delete cascade,
+  -- What this place is: "Head office", "Plant 2", "Distribution centre".
+  -- Nullable, because a company with one location rarely needs to name it.
+  label       text,
+  address     text,
+  city        text,
+  region      text,
+  county      text,
+  area        text,
+  latitude    double precision,
+  longitude   double precision,
+  geo_precision text,
+  -- Exactly one per company, enforced below. The primary location is the one
+  -- that stands in wherever the app still has room for only one place — the
+  -- list row, the search hit, the company header.
+  is_primary  boolean not null default false,
+  sort        integer not null default 0,
+  created_by  uuid references profiles on delete set null,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
+create index if not exists company_locations_company_idx
+  on company_locations (company_id, sort, created_at);
+create index if not exists company_locations_region_idx on company_locations (region);
+create index if not exists company_locations_area_idx on company_locations (area);
+-- The map reads every located row in one query, so the partial index is the
+-- one that matters.
+create index if not exists company_locations_point_idx
+  on company_locations (latitude, longitude) where latitude is not null;
+
+-- One primary per company. A partial unique index says it once, and says it in
+-- the database rather than in whichever code path forgot.
+create unique index if not exists company_locations_one_primary
+  on company_locations (company_id) where is_primary;
+
+drop trigger if exists company_locations_touch on company_locations;
+create trigger company_locations_touch before update on company_locations
+  for each row execute function touch_updated_at();
+
+alter table company_locations enable row level security;
+
+do $$
+begin
+  if not exists (select 1 from pg_policies where tablename='company_locations' and policyname='company_locations_read') then
+    create policy company_locations_read on company_locations for select using (has_access());
+  end if;
+  if not exists (select 1 from pg_policies where tablename='company_locations' and policyname='company_locations_insert') then
+    create policy company_locations_insert on company_locations for insert with check (is_member());
+  end if;
+  if not exists (select 1 from pg_policies where tablename='company_locations' and policyname='company_locations_update') then
+    create policy company_locations_update on company_locations for update using (is_member());
+  end if;
+  if not exists (select 1 from pg_policies where tablename='company_locations' and policyname='company_locations_delete') then
+    create policy company_locations_delete on company_locations for delete using (is_member());
+  end if;
+end $$;
+
+/**
+ * Keep "exactly one primary" true without making every caller think about it.
+ *
+ * The unique index above rejects a second primary; on its own that just moves
+ * the problem to the UI, which would have to clear the old one first and would
+ * race with anyone else editing. Instead, setting a location primary demotes
+ * the others, and the first location a company gets is primary by default.
+ */
+create or replace function company_locations_set_primary()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  -- The first location for a company is its primary, whatever the caller said.
+  --
+  -- INSERT only, and that guard is load-bearing. The demotion below re-enters
+  -- this trigger for the row being demoted; on an INSERT the new row is not
+  -- visible yet, so without the guard the demoted row would look like the
+  -- company's only location, promote itself straight back, and the insert would
+  -- then fail the one-primary unique index.
+  if tg_op = 'INSERT'
+     and not exists (select 1 from company_locations
+                      where company_id = new.company_id
+                        and id is distinct from new.id) then
+    new.is_primary := true;
+  end if;
+
+  if new.is_primary then
+    update company_locations
+       set is_primary = false
+     where company_id = new.company_id
+       and id is distinct from new.id
+       and is_primary;
+  end if;
+
+  return new;
+end;
+$$;
+
+revoke execute on function company_locations_set_primary() from anon, authenticated, public;
+
+drop trigger if exists company_locations_primary on company_locations;
+create trigger company_locations_primary
+  before insert or update of is_primary on company_locations
+  for each row execute function company_locations_set_primary();
+
+/**
+ * Deleting the primary promotes the next one rather than leaving a company
+ * with locations but no primary — a state every read path would have to
+ * special-case forever.
+ */
+create or replace function company_locations_repromote()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  if not old.is_primary then return old; end if;
+  -- The company itself may be mid-cascade, in which case there is nothing to
+  -- promote and nothing to fix.
+  if not exists (select 1 from companies where id = old.company_id) then return old; end if;
+
+  update company_locations
+     set is_primary = true
+   where id = (select id from company_locations
+                where company_id = old.company_id
+                order by sort, created_at
+                limit 1);
+  return old;
+end;
+$$;
+
+revoke execute on function company_locations_repromote() from anon, authenticated, public;
+
+drop trigger if exists company_locations_repromoted on company_locations;
+create trigger company_locations_repromoted
+  after delete on company_locations
+  for each row execute function company_locations_repromote();
+
+-- ========================================================== 2. backfill
+
+-- One primary row per company that actually had a location. A company with
+-- nothing but a name gets no row at all — an empty location is not a place,
+-- and the map's "without a location" count depends on the difference.
+--
+-- Wrapped in a column-existence check, and executed dynamically, because
+-- section 6 drops the columns this reads. On a second run they are gone, and a
+-- plain statement naming `c.address` would fail to parse even though the guard
+-- around it is false — plpgsql only plans the string when it runs it.
+do $$
+begin
+  if exists (select 1 from information_schema.columns
+              where table_schema = 'public' and table_name = 'companies'
+                and column_name = 'address') then
+    execute $sql$
+      insert into company_locations (
+        company_id, label, address, city, region, county, area,
+        latitude, longitude, geo_precision, is_primary, created_by, created_at
+      )
+      select c.id, null, c.address, c.city, c.region, c.county, c.area,
+             c.latitude, c.longitude, c.geo_precision, true, c.created_by, c.created_at
+      from companies c
+      where (c.address is not null or c.city is not null or c.region is not null
+             or c.county is not null or c.area is not null or c.latitude is not null)
+        and not exists (select 1 from company_locations l where l.company_id = c.id)
+    $sql$;
+  end if;
+end $$;
+
+-- ========================================================= 3. filtering
+
+/**
+ * The list page filters companies by region and searches them by city, with
+ * exact counts and pagination. "Parent where any child matches" is the one
+ * shape PostgREST cannot express without an inner join, and an inner join
+ * returns a company once per matching location — which silently inflates both
+ * the page and the count.
+ *
+ * So the regions and cities a company has are mirrored back onto it as arrays,
+ * maintained by trigger. This is a derived index, not a second source of
+ * truth: nothing writes it, `company_locations` is the only place a location
+ * is edited, and a GIN index makes `location_regions @> '{Northwest}'` a
+ * single-table lookup.
+ */
+alter table companies add column if not exists location_regions text[] not null default '{}';
+alter table companies add column if not exists location_cities  text[] not null default '{}';
+
+create index if not exists companies_location_regions_idx on companies using gin (location_regions);
+create index if not exists companies_location_cities_idx  on companies using gin (location_cities);
+
+-- The `is distinct from` guard is not an optimisation: without it, saving a
+-- location without changing its city rewrites the parent company, which bumps
+-- `updated_at` and wakes the company audit trigger for nothing.
+create or replace function refresh_company_places(p_company_id uuid)
+returns void
+language sql
+security definer set search_path = public, pg_temp
+as $$
+  with places as (
+    select coalesce(array_agg(distinct l.region order by l.region)
+                    filter (where l.region is not null), '{}') as regions,
+           coalesce(array_agg(distinct l.city order by l.city)
+                    filter (where l.city is not null), '{}') as cities
+    from company_locations l
+    where l.company_id = p_company_id
+  )
+  update companies c
+     set location_regions = places.regions,
+         location_cities  = places.cities
+    from places
+   where c.id = p_company_id
+     and (c.location_regions is distinct from places.regions
+       or c.location_cities  is distinct from places.cities);
+$$;
+
+revoke execute on function refresh_company_places(uuid) from anon, authenticated, public;
+
+create or replace function company_locations_refresh_places()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  if tg_op = 'DELETE' then
+    perform refresh_company_places(old.company_id);
+    return old;
+  end if;
+  perform refresh_company_places(new.company_id);
+  -- An edit that moves a location to another company has to fix both sides.
+  if tg_op = 'UPDATE' and new.company_id is distinct from old.company_id then
+    perform refresh_company_places(old.company_id);
+  end if;
+  return new;
+end;
+$$;
+
+revoke execute on function company_locations_refresh_places() from anon, authenticated, public;
+
+drop trigger if exists company_locations_places on company_locations;
+create trigger company_locations_places
+  after insert or update or delete on company_locations
+  for each row execute function company_locations_refresh_places();
+
+-- Seed the arrays for everything the backfill just inserted.
+select refresh_company_places(id) from companies;
+
+-- ========================================================= 4. geocoding
+
+-- Geocoding now resolves one location, not one company. The Edge Function
+-- still validates the point before calling this; what changed is that the
+-- thing being placed on the map has its own id.
+drop function if exists set_company_point(uuid, double precision, double precision);
+
+create or replace function set_location_point(p_id uuid, p_lat double precision, p_lon double precision)
+returns void
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+begin
+  update company_locations
+     set latitude      = p_lat,
+         longitude     = p_lon,
+         geo_precision = 'address',
+         area          = ez_area(p_lat, p_lon)
+   where id = p_id;
+end;
+$$;
+
+revoke execute on function set_location_point(uuid, double precision, double precision)
+  from anon, authenticated, public;
+
+-- ============================================================= 5. audit
+
+alter table audit_events drop constraint if exists audit_events_entity_check;
+alter table audit_events add constraint audit_events_entity_check
+  check (entity in ('company', 'contact', 'task', 'activity',
+                    'deletion_request', 'member', 'data', 'template', 'setting',
+                    'attachment', 'location'));
+
+-- Coordinates and the derived area are the geocoder's business, not the
+-- feed's: a batch run would otherwise write a line per company.
+create or replace function audit_ignored_column(col text)
+returns boolean
+language sql
+immutable
+as $$
+  select col in ('updated_at', 'last_touch_at', 'tier_rank', 'area', 'geo_precision',
+                 'archived_at', 'latitude', 'longitude',
+                 'location_regions', 'location_cities');
+$$;
+
+create or replace function audit_location()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+declare
+  changed text[];
+  place text;
+begin
+  if tg_op = 'DELETE' then
+    if audit_parent_gone(old.company_id) then return old; end if;
+    perform audit_log('location', 'deleted', old.id, old.company_id,
+                      format('Removed the location %s',
+                             coalesce(old.label, old.city, old.address, 'without a name')),
+                      null);
+    return old;
+  end if;
+
+  place := coalesce(new.label, new.city, new.address, 'a location');
+
+  if tg_op = 'INSERT' then
+    perform audit_log('location', 'created', new.id, new.company_id,
+                      format('Added the location %s', place),
+                      jsonb_build_object('primary', new.is_primary));
+    return new;
+  end if;
+
+  changed := audit_changed_fields(to_jsonb(old), to_jsonb(new));
+  if array_length(changed, 1) is null then return new; end if;
+
+  perform audit_log('location', 'updated', new.id, new.company_id,
+                    format('Edited %s (%s)', place, array_to_string(changed, ', ')),
+                    jsonb_build_object('fields', changed));
+  return new;
+end;
+$$;
+
+revoke execute on function audit_location() from anon, authenticated, public;
+
+drop trigger if exists company_locations_audit on company_locations;
+create trigger company_locations_audit
+  after insert or update or delete on company_locations
+  for each row execute function audit_location();
+
+-- ============================================================== 6. drop
+
+-- The search index names `city`, so it has to go before the column does. The
+-- replacement drops city from the vector: a company's cities live on its
+-- locations now, and the palette searches those directly.
+drop index if exists companies_search;
+drop index if exists companies_area_idx;
+
+create index if not exists companies_search on companies
+  using gin (to_tsvector('english',
+    name || ' ' || coalesce(industry, '') || ' ' || coalesce(notes, '')
+         || ' ' || coalesce(type, '')));
+
+alter table companies drop column if exists address;
+alter table companies drop column if exists city;
+alter table companies drop column if exists region;
+alter table companies drop column if exists county;
+alter table companies drop column if exists area;
+alter table companies drop column if exists latitude;
+alter table companies drop column if exists longitude;
+alter table companies drop column if exists geo_precision;
+
+-- ============================================ committed gate, removed
+-- Mirrored from supabase/migrations/016_drop_committed_gate.sql. The gate is
+-- still created above (014's section) so this file and the migration chain
+-- land on the same schema; it is dropped here for the same reason.
+drop trigger if exists companies_committed_gate on companies;
+drop function if exists check_committed_ready();
+
+-- ================================== access checks once per query
+-- Mirrored from supabase/migrations/017_rls_initplan.sql: every policy above
+-- is rewritten so its helper call runs once as an InitPlan, not per row.
+-- ------------------------------------------------------------- reads
+
+alter policy activities_read        on activities        using ((select has_access()));
+alter policy attachments_read       on attachments       using ((select has_access()));
+alter policy audit_events_read      on audit_events      using ((select has_access()));
+alter policy companies_read         on companies         using ((select has_access()));
+alter policy company_deletions_read on company_deletions using ((select has_access()));
+alter policy company_locations_read on company_locations using ((select has_access()));
+alter policy contacts_read          on contacts          using ((select has_access()));
+alter policy deletion_requests_read on deletion_requests using ((select has_access()));
+alter policy email_templates_read   on email_templates   using ((select has_access()));
+alter policy profiles_read          on profiles          using ((select has_access()));
+alter policy settings_read          on settings          using ((select has_access()));
+alter policy status_events_read     on status_events     using ((select has_access()));
+alter policy tasks_read             on tasks             using ((select has_access()));
+alter policy saved_views_read       on saved_views
+  using ((select has_access()) and (shared or owner_id = (select auth.uid())));
+
+alter policy geocache_read               on geocache            using ((select is_member()));
+alter policy auth_email_requests_admin_read on auth_email_requests using ((select is_admin()));
+alter policy login_events_admin_read     on login_events        using ((select is_admin()));
+
+-- ------------------------------------------------------------ writes
+
+alter policy activities_insert        on activities        with check ((select is_member()));
+alter policy attachments_insert       on attachments       with check ((select is_member()));
+alter policy companies_insert         on companies         with check ((select is_member()));
+alter policy company_locations_insert on company_locations with check ((select is_member()));
+alter policy contacts_insert          on contacts          with check ((select is_member()));
+alter policy email_templates_insert   on email_templates   with check ((select is_member()));
+alter policy geocache_write           on geocache          with check ((select is_member()));
+alter policy status_events_insert     on status_events     with check ((select is_member()));
+alter policy tasks_insert             on tasks             with check ((select is_member()));
+
+alter policy activities_update      on activities      using ((select is_member())) with check ((select is_member()));
+alter policy companies_update       on companies       using ((select is_member())) with check ((select is_member()));
+alter policy contacts_update        on contacts        using ((select is_member())) with check ((select is_member()));
+alter policy email_templates_update on email_templates using ((select is_member())) with check ((select is_member()));
+alter policy geocache_update        on geocache        using ((select is_member())) with check ((select is_member()));
+alter policy tasks_update           on tasks           using ((select is_member())) with check ((select is_member()));
+alter policy company_locations_update on company_locations using ((select is_member()));
+
+alter policy companies_delete         on companies         using ((select is_admin()));
+alter policy company_locations_delete on company_locations using ((select is_member()));
+alter policy activities_delete      on activities      using ((select is_admin()) or created_by = (select auth.uid()));
+alter policy attachments_delete     on attachments     using ((select is_admin()) or created_by = (select auth.uid()));
+alter policy contacts_delete        on contacts        using ((select is_admin()) or created_by = (select auth.uid()));
+alter policy email_templates_delete on email_templates using ((select is_admin()) or created_by = (select auth.uid()));
+alter policy tasks_delete           on tasks           using ((select is_admin()) or created_by = (select auth.uid()));
+
+alter policy allowed_emails_admin on allowed_emails using ((select is_admin())) with check ((select is_admin()));
+alter policy settings_write       on settings       using ((select is_admin())) with check ((select is_admin()));
+
+alter policy profiles_self_update on profiles
+  using (id = (select auth.uid())) with check (id = (select auth.uid()));
+
+alter policy saved_views_insert on saved_views
+  with check ((select is_member()) and owner_id = (select auth.uid()));
+alter policy saved_views_update on saved_views
+  using (owner_id = (select auth.uid())) with check (owner_id = (select auth.uid()));
+alter policy saved_views_delete on saved_views
+  using ((select is_admin()) or owner_id = (select auth.uid()));
+
+alter policy deletion_requests_insert on deletion_requests
+  with check ((select is_member()) and requested_by = (select auth.uid()) and status = 'pending');
+alter policy deletion_requests_withdraw on deletion_requests
+  using (requested_by = (select auth.uid()) and status = 'pending')
+  with check (requested_by = (select auth.uid()) and status = 'withdrawn');
+
+-- ==================================== calendar, capabilities, deal roles
+-- Mirrored from supabase/migrations/018_calendar_capabilities_deal_roles.sql.
+
+-- =========================================================== 1. events
+
+-- The plant tour is the club's demo and the reason most companies are in here
+-- at all, yet until now it existed only as a status change and a logged note,
+-- with no date anyone could look ahead to.
+--
+-- company_id is nullable on purpose: a careers fair or a committee deadline is
+-- on the club's calendar without belonging to any one company.
+create table if not exists events (
+  id          uuid primary key default uuid_generate_v4(),
+  company_id  uuid references companies on delete cascade,
+  contact_id  uuid references contacts on delete set null,
+  kind        text not null default 'tour',
+  title       text not null,
+  starts_at   timestamptz not null,
+  ends_at     timestamptz,
+  location    text,
+  notes       text,
+  created_by  uuid references profiles on delete set null,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
+-- Reconciled explicitly: `create table if not exists` skips constraint changes
+-- on a database that already has the table.
+alter table events drop constraint if exists events_kind_check;
+alter table events add constraint events_kind_check
+  check (kind in ('tour', 'meeting', 'event', 'deadline'));
+alter table events drop constraint if exists events_ends_after_starts;
+alter table events add constraint events_ends_after_starts
+  check (ends_at is null or ends_at >= starts_at);
+
+create index if not exists events_starts_idx  on events (starts_at);
+create index if not exists events_company_idx on events (company_id, starts_at);
+create index if not exists events_contact_idx on events (contact_id);
+create index if not exists events_created_by_idx on events (created_by);
+
+drop trigger if exists events_touch on events;
+create trigger events_touch before update on events
+  for each row execute function touch_updated_at();
+
+alter table events enable row level security;
+
+do $$
+begin
+  if not exists (select 1 from pg_policies where tablename='events' and policyname='events_read') then
+    create policy events_read on events for select using ((select has_access()));
+  end if;
+  if not exists (select 1 from pg_policies where tablename='events' and policyname='events_insert') then
+    create policy events_insert on events for insert with check ((select is_member()));
+  end if;
+  if not exists (select 1 from pg_policies where tablename='events' and policyname='events_update') then
+    create policy events_update on events for update
+      using ((select is_member())) with check ((select is_member()));
+  end if;
+  -- Same rule as activities: you can take back your own entry, an admin can
+  -- take back anyone's.
+  if not exists (select 1 from pg_policies where tablename='events' and policyname='events_delete') then
+    create policy events_delete on events for delete
+      using ((select is_admin()) or created_by = (select auth.uid()));
+  end if;
+end $$;
+
+-- ===================================================== 2. capabilities
+
+-- Free text in an array, not a lookup table: a club's vocabulary is "PLC:
+-- Allen-Bradley" and "AS9100", and making an admin define tags before anyone
+-- may use one is how tags stop getting used. The app reuses an existing tag's
+-- spelling when a new one matches it case-insensitively.
+alter table companies add column if not exists capabilities text[] not null default '{}';
+create index if not exists companies_capabilities_idx on companies using gin (capabilities);
+
+-- Every tag in use and how many companies carry it, for the filter dropdown
+-- and the tag editor's suggestions. SECURITY INVOKER, so it sees exactly what
+-- the caller's RLS lets them see — nothing for a stranger.
+create or replace function capability_counts()
+returns table (tag text, companies bigint)
+language sql
+stable
+security invoker
+set search_path = public, pg_temp
+as $$
+  select t.tag, count(*)
+  from companies c, unnest(c.capabilities) as t(tag)
+  where c.archived_at is null
+  group by t.tag
+  order by lower(t.tag);
+$$;
+
+revoke execute on function capability_counts() from anon, public;
+grant execute on function capability_counts() to authenticated;
+
+-- ======================================================= 3. deal roles
+
+-- Who matters in getting to yes, which the org chart does not say: the person
+-- who reports to the plant manager may be the one who actually wants you there.
+alter table contacts add column if not exists deal_role text;
+alter table contacts drop constraint if exists contacts_deal_role_check;
+alter table contacts add constraint contacts_deal_role_check
+  check (deal_role is null or deal_role in ('champion', 'decision_maker', 'technical', 'gatekeeper'));
+
+-- ============================================================ 4. audit
+
+alter table audit_events drop constraint if exists audit_events_entity_check;
+alter table audit_events add constraint audit_events_entity_check
+  check (entity in ('company', 'contact', 'task', 'activity',
+                    'deletion_request', 'member', 'data', 'template', 'setting',
+                    'attachment', 'location', 'event'));
+
+-- The club's time zone (Settings → Club), for dates the database writes into
+-- sentences. The database clock is UTC, so `to_char(starts_at)` alone puts a
+-- 7pm tour in Georgia under tomorrow's date. An unknown zone must not make an
+-- insert fail, so a bad value falls back to UTC rather than raising — and this
+-- tests the name by using it, not by querying pg_timezone_names, which takes
+-- half a second here.
+create or replace function club_time_zone()
+returns text
+language plpgsql
+stable
+security definer set search_path = public, pg_temp
+as $$
+declare tz text;
+begin
+  select value->>'timeZone' into tz from settings where key = 'club';
+  if tz is null or tz = '' then return 'UTC'; end if;
+  perform now() at time zone tz;
+  return tz;
+exception when others then
+  return 'UTC';
+end;
+$$;
+
+revoke execute on function club_time_zone() from anon, authenticated, public;
+
+create or replace function audit_event()
+returns trigger
+language plpgsql
+security definer set search_path = public, pg_temp
+as $$
+declare
+  changed text[];
+  label text;
+  tz text := club_time_zone();
+begin
+  if tg_op = 'DELETE' then
+    if audit_parent_gone(old.company_id) then return old; end if;
+    perform audit_log('event', 'deleted', old.id, old.company_id,
+                      format('Cancelled %s', old.title), null);
+    return old;
+  end if;
+
+  label := format('%s on %s', new.title, to_char(new.starts_at at time zone tz, 'Mon FMDD'));
+
+  if tg_op = 'INSERT' then
+    perform audit_log('event', 'created', new.id, new.company_id,
+                      format('Scheduled %s', label),
+                      jsonb_build_object('kind', new.kind, 'starts_at', new.starts_at));
+    return new;
+  end if;
+
+  changed := audit_changed_fields(to_jsonb(old), to_jsonb(new));
+  if array_length(changed, 1) is null then return new; end if;
+
+  perform audit_log('event', 'updated', new.id, new.company_id,
+                    format('Changed %s (%s)', label, array_to_string(changed, ', ')),
+                    jsonb_build_object('fields', changed));
+  return new;
+end;
+$$;
+
+revoke execute on function audit_event() from anon, authenticated, public;
+
+drop trigger if exists events_audit on events;
+create trigger events_audit
+  after insert or update or delete on events
+  for each row execute function audit_event();
+
+-- ---------------------------------------------------------------- bootstrap
+-- Replace with your own address, run it, then sign in once to create your user.
+-- After that, promote yourself:
+--   update profiles set role = 'admin' where email = 'you@example.com';
+
+-- insert into allowed_emails (email, note) values ('you@example.com', 'founder');

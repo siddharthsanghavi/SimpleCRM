@@ -1,0 +1,212 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Channel triplets, not hex, so Tailwind's `/opacity` modifier still works —
+   `text-black/45` compiles to rgb(var(--fg) / 0.45). See tailwind.config.ts for
+   why black and white are the things being redefined. */
+:root {
+  --fg: 0 0 0;
+  --surface: 255 255 255;
+  --ink: 18 21 26;
+  --paper: 247 247 245;
+  --rail: 255 255 255;
+
+  --accent: 15 118 110;
+
+  --danger: 190 18 60;
+  --success: 4 120 87;
+  --warn: 180 83 9;
+
+  /* Pipeline chart. An inline SVG can't use Tailwind's `dark:` variants on
+     `fill`, so its palette lives here as variables the SVG references. */
+  --st-neutral-box: #f1f5f9;  --st-neutral-text: #334155;  --st-neutral-edge: #cbd5e1;
+  --st-blue-box:    #dbeafe;  --st-blue-text:    #1e40af;  --st-blue-edge:    #93c5fd;
+  --st-amber-box:   #fef3c7;  --st-amber-text:   #92400e;  --st-amber-edge:   #fcd34d;
+  --st-green-box:   #ccfbf1;  --st-green-text:   #0f766e;  --st-green-edge:   #5eead4;
+  --st-rose-box:    #ffe4e6;  --st-rose-text:    #9f1239;  --st-rose-edge:    #fda4af;
+  --st-dormant-text: #64748b;
+  --st-arrow: #94a3b8;
+  --st-arrow-soft: #cbd5e1;
+  --st-flow-label: #64748b;
+
+  color-scheme: light;
+}
+
+.dark {
+  --fg: 255 255 255;
+  /* Cards sit slightly above the page rather than below it, the same way the
+     light theme puts white cards on off-white paper. */
+  --surface: 23 25 29;
+  --ink: 237 240 245;
+  --paper: 14 16 19;
+  /* The rail matches the card surface, exactly as it does in light mode where
+     both are white. Recessing it instead was measurably worse: against a
+     near-black page, going darker tops out around a 1.05 contrast ratio, so
+     the rail stopped reading as a distinct region at all. */
+  --rail: 23 25 29;
+
+  /* Lifted for contrast on a near-black surface. */
+  --accent: 45 212 191;
+
+  /* Lightened: rose-700 on a near-black card fails contrast badly. */
+  --danger: 253 164 175;
+  --success: 110 231 183;
+  --warn: 252 211 77;
+
+  /* Pipeline chart: same hues, inverted weighting — a dim translucent fill
+     with a light label, instead of a pale fill with a dark one. */
+  --st-neutral-box: #1e242c;  --st-neutral-text: #cbd5e1;  --st-neutral-edge: #3a4453;
+  --st-blue-box:    #16263f;  --st-blue-text:    #93c5fd;  --st-blue-edge:    #2f4d78;
+  --st-amber-box:   #33260d;  --st-amber-text:   #fcd34d;  --st-amber-edge:   #6b5115;
+  --st-green-box:   #0c2b28;  --st-green-text:   #2dd4bf;  --st-green-edge:   #175a52;
+  --st-rose-box:    #351520;  --st-rose-text:    #fda4af;  --st-rose-edge:    #6b2b3a;
+  --st-dormant-text: #8b98a9;
+  --st-arrow: #64748b;
+  --st-arrow-soft: #48525f;
+  --st-flow-label: #94a3b8;
+
+  /* Makes native date pickers, selects, and scrollbars follow the theme.
+     This app is full of them, so without it dark mode looks half-finished. */
+  color-scheme: dark;
+}
+
+@layer base {
+  body {
+    @apply bg-paper text-ink antialiased;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-[10px] border border-black/[0.08] bg-white;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm
+           font-medium transition disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-ink text-white hover:bg-ink/85;
+  }
+  .btn-ghost {
+    @apply btn border border-black/10 bg-white hover:bg-black/[0.03];
+  }
+  .field {
+    @apply w-full rounded-md border border-black/15 bg-white px-3 py-2 text-sm
+           outline-none focus:border-accent/50 focus:ring-2 focus:ring-accent/15;
+  }
+  .label {
+    @apply mb-1 block text-xs font-medium uppercase tracking-wide text-black/50;
+  }
+  .chip {
+    @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium;
+  }
+  .railitem {
+    @apply flex items-center gap-2.5 rounded-[7px] px-2.5 py-[7px] text-[13.5px]
+           text-black/60 transition hover:bg-black/[0.05] hover:text-ink;
+  }
+  .railitem-active {
+    @apply bg-black/[0.06] font-semibold text-ink;
+  }
+}
+
+/* Leaflet renders popups and cluster icons as raw HTML, so these are plain CSS
+   rather than Tailwind classes — which also means they need the theme tokens
+   spelled out by hand. */
+.leaflet-popup-content .pop { font-size: 13px; line-height: 1.45; }
+.leaflet-popup-content .pop .title {
+  font-weight: 600; font-size: 14px; color: rgb(var(--ink)); text-decoration: none;
+}
+.leaflet-popup-content .pop .title:hover { text-decoration: underline; }
+.leaflet-popup-content .pop .sub { color: rgb(var(--fg) / 0.5); font-size: 11px; margin-top: 3px; }
+
+/* Leaflet's own chrome is hardcoded white. */
+.dark .leaflet-popup-content-wrapper,
+.dark .leaflet-popup-tip,
+.dark .leaflet-control-zoom a,
+.dark .leaflet-control-attribution {
+  background: rgb(var(--surface));
+  color: rgb(var(--ink));
+}
+.dark .leaflet-control-zoom a { border-color: rgb(var(--fg) / 0.15); }
+.dark .leaflet-control-zoom a:hover { background: rgb(var(--fg) / 0.08); }
+.dark .leaflet-control-attribution a { color: rgb(var(--ink) / 0.7); }
+
+/* OpenStreetMap has no free dark raster tiles, and adding a provider would mean
+   an API key and a bill. Inverting the tile pane only — not the whole map —
+   gives a dark basemap while pins, clusters, and popups keep their real
+   colours. hue-rotate puts water and greens back the right way round. */
+.dark .leaflet-tile-pane {
+  filter: invert(1) hue-rotate(180deg) brightness(0.92) contrast(0.9) saturate(0.8);
+}
+.leaflet-popup-content .pop .badges { margin-top: 7px; display: flex; flex-wrap: wrap; gap: 4px; }
+.leaflet-popup-content .pop .b {
+  border-radius: 999px; padding: 1px 8px; font-size: 10px; font-weight: 600;
+  background: color-mix(in srgb, var(--c, #64748b) 15%, white); color: var(--c, #64748b);
+}
+.leaflet-popup-content .pop .b-status { --c: #475569; text-transform: capitalize; }
+.leaflet-popup-content .pop .b-owner  { --c: #0f766e; }
+.leaflet-popup-content .pop .approx { margin-top: 6px; font-size: 10px; color: rgba(0,0,0,0.4); }
+.leaflet-popup-content .pop .go {
+  display: inline-block; margin-top: 8px; font-size: 12px; color: #12151a; text-decoration: underline;
+}
+
+.ez-cluster {
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 999px; font-weight: 700; font-size: 12px; color: #fff;
+  background: var(--c); border: 2px solid rgba(255,255,255,0.85);
+  box-shadow: 0 1px 6px rgba(0,0,0,0.28);
+}
+
+.ez-area {
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 999px; font-weight: 700; font-size: 12px; color: #fff;
+  background: color-mix(in srgb, var(--c) 88%, transparent);
+  border: 2px solid rgba(255, 255, 255, 0.9);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+}
+.ez-area:hover { background: var(--c); }
+
+/* ---------------------------------------------------------------- guide figures
+   Looping demonstrations in the guide. Written so the RESTING state is the
+   finished state -- boxes ticked, bar shown, row present -- and the animation
+   only plays where motion is welcome. Someone with reduced-motion set sees the
+   outcome rather than an empty form, which is the useful half anyway. */
+
+@media (prefers-reduced-motion: no-preference) {
+  .fig-tick    { animation: fig-tick 7s ease-in-out infinite; }
+  .fig-bar     { animation: fig-bar 7s ease-in-out infinite; }
+  .fig-press   { animation: fig-press 7s ease-in-out infinite; }
+  .fig-row     { animation: fig-row 7s ease-in-out infinite; }
+  .fig-d1 { animation-delay: 0.25s; }
+  .fig-d2 { animation-delay: 0.55s; }
+}
+
+/* Checkbox filling in. */
+@keyframes fig-tick {
+  0%, 8%    { background-color: transparent; border-color: rgb(var(--fg) / 0.25); }
+  14%, 78%  { background-color: rgb(var(--ink)); border-color: rgb(var(--ink)); }
+  86%, 100% { background-color: transparent; border-color: rgb(var(--fg) / 0.25); }
+}
+
+/* The bulk bar rising once something is selected. */
+@keyframes fig-bar {
+  0%, 16%   { opacity: 0; transform: translateY(8px); }
+  24%, 78%  { opacity: 1; transform: translateY(0); }
+  86%, 100% { opacity: 0; transform: translateY(8px); }
+}
+
+/* A button being pressed. */
+@keyframes fig-press {
+  0%, 40%   { box-shadow: 0 0 0 0 rgb(var(--accent) / 0.5); }
+  48%       { box-shadow: 0 0 0 5px rgb(var(--accent) / 0); transform: scale(0.97); }
+  56%, 100% { box-shadow: 0 0 0 0 rgb(var(--accent) / 0); transform: scale(1); }
+}
+
+/* The logged entry appearing in the timeline. */
+@keyframes fig-row {
+  0%, 50%   { opacity: 0; transform: translateY(-6px); max-height: 0; }
+  60%, 84%  { opacity: 1; transform: translateY(0); max-height: 80px; }
+  92%, 100% { opacity: 0; transform: translateY(-6px); max-height: 0; }
+}
